@@ -1,0 +1,50 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Test/type/lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Training/evaluation outputs
+outputs/
+outputs_abseef/
+train_out/
+results/
+results_*/
+visualization/
+
+# Checkpoints and model artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Logs and temporary run files
+*.log
+nohup.out
+wandb/
+runs/
+
+# Generated action dumps
+episode*_gt_actions.json
+episode*_gt_actions.jsonl
+episode*_relative_gt_actions*.json
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+examples/

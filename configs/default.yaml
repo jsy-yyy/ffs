@@ -1,0 +1,56 @@
+backbone:
+  foundation_root: /data/jsy/Fast-FoundationStereo
+  checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
+  feature_names: [feat_04, feat_08, feat_16, feat_32]
+  freeze: true
+  valid_iters: 4
+  max_disp: 192
+  optimize_build_volume: pytorch1
+
+dataset:
+  root: /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
+  image_size: [256, 320]
+  camera_pairs:
+    - [observation.images.head_camera_left, observation.images.head_camera_right]
+    - [observation.images.front_camera_left, observation.images.front_camera_right]
+    # - [observation.images.left_camera_left, observation.images.left_camera_right]
+    # - [observation.images.right_camera_left, observation.images.right_camera_right]
+  action_normalization:
+    method: quantile
+    normalize_indices: [0, 1, 2, 8, 9, 10]
+    stats:
+      q01: [-0.06172713458538055, -0.000036716461181640625, -0.08783501386642456, -1.0, -1.0, -1.0, -1.0, 0.0, -0.3547105032205582, -0.0000013113021850585938, -0.11975435614585876, -1.0, -1.0, -1.0, -1.0, 0.0]
+      q99: [0.3462600058317184, 0.39966784834861746, 0.14745532035827624, 1.0, 1.0, 1.0, 1.0, 1.0, 0.034201726913452024, 0.39142737388610793, 0.1792279863357542, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+policy:
+  num_history_frames: 2
+  action_horizon: 8
+  action_dim: 16
+  state_dim: 16
+  use_disparity: true
+
+head:
+  type: mlp
+  condition_token_dim: 256
+  disp_grid_size: [4, 5]
+  mlp:
+    hidden_dim: 512
+    num_blocks: 10
+    dropout: 0.0
+  rdt:
+    hidden_size: 256
+    depth: 4
+    num_heads: 8
+    num_inference_steps: 10
+
+train:
+  output_dir: outputs/rdt_version_1_clean
+  epochs: 50
+  batch_size: 4
+  num_workers: 4
+  lr: 1.0e-4
+  weight_decay: 0.0
+  amp: true
+  log_interval: 50
+  save_ckpt_interval: 3000
+  resume_from: 
