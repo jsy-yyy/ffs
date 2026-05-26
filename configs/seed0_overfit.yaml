@@ -14,6 +14,8 @@ dataset:
   camera_pairs:
     - [observation.images.head_camera_left, observation.images.head_camera_right]
     - [observation.images.front_camera_left, observation.images.front_camera_right]
+    - [observation.images.left_camera_left, observation.images.left_camera_right]
+    - [observation.images.right_camera_left, observation.images.right_camera_right]
   action_normalization:
     method: quantile
     normalize_indices: [0, 1, 2, 8, 9, 10]
@@ -35,20 +37,20 @@ head:
   mlp:
     hidden_dim: 512
     num_blocks: 10
-    dropout: 0.0
+    dropout: 0.1
   rdt:
     hidden_size: 256
     depth: 4
     num_heads: 8
-    num_inference_steps: 10
+    num_inference_steps: 100
 
 train:
-  output_dir: outputs/mlp_seed0_overfit_500
-  epochs: 2000
+  output_dir: outputs/mlp_seed0_overfit_500_4views
+  epochs: 500
   batch_size: 4
   num_workers: 0
   lr: 3.0e-5
-  weight_decay: 0.0
+  weight_decay: 0.1
   amp: true
   suppress_dynamo_errors: true
   log_interval: 50
