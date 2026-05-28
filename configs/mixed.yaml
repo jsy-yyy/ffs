@@ -8,8 +8,9 @@ backbone:
   optimize_build_volume: pytorch1
 
 dataset:
-  root: /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
-  episode_indices: [0]
+  roots:
+    - /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
+    - /data/jsy/Fast-FoundationStereo/lerobot_dataset_randomized
   image_size: [256, 320]
   camera_pairs:
     - [observation.images.head_camera_left, observation.images.head_camera_right]
@@ -20,8 +21,8 @@ dataset:
     method: quantile
     normalize_indices: [0, 1, 2, 8, 9, 10]
     stats:
-      q01: [-0.03916368633508682, -0.09087245911359787, -0.001716530998237431, 0.9554034471511841, -0.051685038954019547, -0.005511453375220299, -0.053018439561128616, 0.0, -5.367194830796507e-07, -8.99987142588543e-08, -5.3665138999292594e-09, 1.0, -3.075579684264085e-07, -4.609865754900966e-06, -6.854533580735733e-07, 1.0]
-      q99: [0.12623801827430725, 0.0008629377116449177, 0.10201482474803925, 1.0, 0.0015613483265042305, 0.29007861018180847, 0.06840682029724121, 1.0, 5.989971185726972e-08, 1.516739587259508e-07, 2.8067827315680915e-06, 1.0, 9.843553243626957e-07, 9.384382337884745e-08, 1.947882992681116e-06, 1.0]
+      q01: [-0.03362764045596123, -0.06750572472810745, -0.0010842629708349705, 0.9550998210906982, -0.04507680609822273, -0.005762048531323671, -0.04253140091896057, 0.0, -0.03371812775731087, -0.0005596106639131904, -0.0010518922936171293, 0.9561926126480103, -0.0005458113737404346, -0.00557631254196167, -0.05721928924322128, 0.0]
+      q99: [0.09689392149448395, 0.00040638691280037165, 0.07575738430023193, 1.0, 0.0018149430397897959, 0.29106417298316956, 0.05870910733938217, 1.0, 0.09757352620363235, 0.06443507969379425, 0.07772304862737656, 1.0, 0.0438656285405159, 0.28803691267967224, 0.03714333102107048, 1.0]
 
 policy:
   num_history_frames: 2
@@ -32,7 +33,7 @@ policy:
   disparity_ablation: none
 
 head:
-  type: mlp
+  type: rdt
   condition_token_dim: 256
   feature_queries_per_scale: 2
   disp_queries: 4
@@ -45,24 +46,35 @@ head:
     hidden_size: 256
     depth: 4
     num_heads: 8
-    num_inference_steps: 100
+    num_kv_heads: 8
+    norm_eps: 1.0e-5
+    multiple_of: 256
+    ffn_dim_multiplier:
+    use_flash_attn: true
+    num_register_tokens: 4
+    num_inference_steps: 10
+    sample_init: zeros
+    act_adaptor: mlp3x_silu
+    state_adaptor: mlp3x_silu
+    img_adaptor: linear
+    dtype: float32
 
 train:
-  output_dir: outputs/mlp_query_overfit500_new
-  epochs: 500
+  output_dir: outputs/rdt_v1_mixed_zeros_init
+  epochs: 50
   batch_size: 2
-  num_workers: 0
-  lr: 3.0e-5
+  num_workers: 4
+  lr: 3e-5
   weight_decay: 0.1
   amp: true
   suppress_dynamo_errors: true
   log_interval: 50
-  save_ckpt_interval: 3000
-  resume_from: 
+  save_ckpt_interval: 10000
+  resume_from:
 
 visualization:
   query_attention:
-    enabled: true
+    enabled: false
     mode: all
     sources: all
     view: all

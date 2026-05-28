@@ -1,7 +1,7 @@
 backbone:
   foundation_root: /data/jsy/Fast-FoundationStereo
   checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
-  feature_names: [feat_04, feat_08, feat_16, feat_32]
+  feature_names: [feat_04, feat_32]
   freeze: true
   valid_iters: 4
   max_disp: 192
@@ -19,8 +19,8 @@ dataset:
     method: quantile
     normalize_indices: [0, 1, 2, 8, 9, 10]
     stats:
-      q01: [-0.06172713458538055, -0.000036716461181640625, -0.08783501386642456, -1.0, -1.0, -1.0, -1.0, 0.0, -0.3547105032205582, -0.0000013113021850585938, -0.11975435614585876, -1.0, -1.0, -1.0, -1.0, 0.0]
-      q99: [0.3462600058317184, 0.39966784834861746, 0.14745532035827624, 1.0, 1.0, 1.0, 1.0, 1.0, 0.034201726913452024, 0.39142737388610793, 0.1792279863357542, 1.0, 1.0, 1.0, 1.0, 1.0]
+      q01: [-0.03120909258723259, -0.06520890444517136, -0.0009331027395091951, 0.957804262638092, -0.04635748639702797, -0.005277806427329779, -0.043041497468948364, 0.0, -0.03639077767729759, -0.0006847904878668487, -0.0012572933919727802, 0.9542942047119141, -0.0005909204483032227, -0.006055351346731186, -0.059804659336805344, 0.0]
+      q99: [0.08293195068836212, 0.00038992761983536184, 0.06834829598665237, 1.0, 0.001792803406715393, 0.2803484797477722, 0.060310665518045425, 1.0, 0.10343658179044724, 0.0697120949625969, 0.08555547147989273, 1.0, 0.04566377401351929, 0.2953159213066101, 0.03881560266017914, 1.0]
 
 policy:
   num_history_frames: 2
@@ -28,11 +28,14 @@ policy:
   action_dim: 16
   state_dim: 16
   use_disparity: true
+  disparity_ablation: none
 
 head:
-  type: mlp
+  type: rdt
   condition_token_dim: 256
-  disp_grid_size: [4, 5]
+  feature_queries_per_scale: 2
+  disp_queries: 4
+  spatial_query_num_heads: 8
   mlp:
     hidden_dim: 512
     num_blocks: 10
@@ -41,16 +44,39 @@ head:
     hidden_size: 256
     depth: 4
     num_heads: 8
+    num_kv_heads: 8
+    norm_eps: 1.0e-5
+    multiple_of: 256
+    ffn_dim_multiplier:
+    use_flash_attn: true
+    num_register_tokens: 4
     num_inference_steps: 10
+    sample_init: zeros
+    act_adaptor: mlp3x_silu
+    state_adaptor: mlp3x_silu
+    img_adaptor: linear
+    dtype: float32
 
 train:
-  output_dir: outputs/rdt_version_1_clean
-  epochs: 50
-  batch_size: 4
+  output_dir: outputs/rdt_v1
+  epochs: 100
+  batch_size: 2
   num_workers: 4
-  lr: 1.0e-4
-  weight_decay: 0.0
+  lr: 3e-4
+  weight_decay: 0.1
   amp: true
   log_interval: 50
   save_ckpt_interval: 3000
   resume_from: 
+
+visualization:
+  query_attention:
+    enabled: false
+    mode: all
+    sources: all
+    view: all
+    time: -1
+    query: all
+    fps: 10
+    alpha: 0.45
+    max_frames: 200

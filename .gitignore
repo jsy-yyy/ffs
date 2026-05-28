@@ -22,7 +22,7 @@ outputs_abseef/
 train_out/
 results/
 results_*/
-visualization/
+/visualization/
 
 # Checkpoints and model artifacts
 *.pt
@@ -48,3 +48,4 @@ Thumbs.db
 *.swo
 
 examples/
+tests/

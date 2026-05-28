@@ -9,7 +9,7 @@ import imageio
 import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import ConcatDataset, Dataset
 
 
 DUAL_ARM_EEF_NAMES = [
@@ -351,6 +351,68 @@ class LeRobotStereoDataset(Dataset):
             "relative_action": relative_action,
             "absolute_action": absolute_action,
         }
+
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        return self.action_normalizer.normalize_action(action)
+
+    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        return self.action_normalizer.denormalize_action(action)
+
+
+class MultiLeRobotStereoDataset(Dataset):
+    """Concatenate compatible LeRobot stereo datasets without copying data."""
+
+    def __init__(
+        self,
+        roots: list[str | Path] | tuple[str | Path, ...],
+        camera_pairs: list[list[str]],
+        num_history_frames: int,
+        action_horizon: int,
+        image_size: list[int] | tuple[int, int] | None = None,
+        episode_indices: list[int] | tuple[int, ...] | set[int] | None = None,
+        action_normalization: dict[str, Any] | None = None,
+    ) -> None:
+        if not roots:
+            raise ValueError("dataset.roots must be non-empty when provided.")
+
+        self.datasets = [
+            LeRobotStereoDataset(
+                root=root,
+                camera_pairs=camera_pairs,
+                num_history_frames=num_history_frames,
+                action_horizon=action_horizon,
+                image_size=image_size,
+                episode_indices=episode_indices,
+                action_normalization=action_normalization,
+            )
+            for root in roots
+        ]
+        first = self.datasets[0]
+        self.roots = [dataset.root for dataset in self.datasets]
+        self.state_dim = first.state_dim
+        self.action_dim = first.action_dim
+        self.action_normalizer = first.action_normalizer
+        self.sample_counts = [len(dataset) for dataset in self.datasets]
+
+        for dataset in self.datasets[1:]:
+            if dataset.state_dim != self.state_dim:
+                raise ValueError(
+                    f"All datasets must have state_dim={self.state_dim}; "
+                    f"{dataset.root} has state_dim={dataset.state_dim}."
+                )
+            if dataset.action_dim != self.action_dim:
+                raise ValueError(
+                    f"All datasets must have action_dim={self.action_dim}; "
+                    f"{dataset.root} has action_dim={dataset.action_dim}."
+                )
+
+        self._concat = ConcatDataset(self.datasets)
+
+    def __len__(self) -> int:
+        return len(self._concat)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return self._concat[idx]
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         return self.action_normalizer.normalize_action(action)

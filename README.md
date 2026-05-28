@@ -72,7 +72,9 @@ backbone:
 head:
   type: rdt
   condition_token_dim: 256
-  disp_grid_size: [4, 5]
+  feature_queries_per_scale: 4
+  disp_queries: 8
+  spatial_query_num_heads: 8
   rdt:
     hidden_size: 256
     depth: 4
@@ -192,3 +194,9 @@ python scripts/eval_offline.py --max-batches 1 --batch-size 1 --num-workers 0 --
 The script reports action-chunk `mse`, `rmse`, and `mae` over the configured
 dataset. Use `--dataset-root /path/to/lerobot_dataset_clean` to override the
 dataset path without editing the config.
+
+To save query-token attention heatmaps as a video during offline evaluation:
+
+```bash
+python scripts/eval_offline.py --max-batches 1 --batch-size 1 --num-workers 0 --visualize-query-attention
+```

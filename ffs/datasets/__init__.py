@@ -1,3 +1,15 @@
-from .lerobot import ActionNormalizer, LeRobotStereoDataset, denormalize_action, normalize_action
+from .lerobot import (
+    ActionNormalizer,
+    LeRobotStereoDataset,
+    MultiLeRobotStereoDataset,
+    denormalize_action,
+    normalize_action,
+)
 
-__all__ = ["ActionNormalizer", "LeRobotStereoDataset", "denormalize_action", "normalize_action"]
+__all__ = [
+    "ActionNormalizer",
+    "LeRobotStereoDataset",
+    "MultiLeRobotStereoDataset",
+    "denormalize_action",
+    "normalize_action",
+]

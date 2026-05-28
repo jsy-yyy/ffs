@@ -22,9 +22,14 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ffs import load_config_for_checkpoint
-from ffs.datasets import LeRobotStereoDataset
+from ffs.datasets import LeRobotStereoDataset, MultiLeRobotStereoDataset
 from ffs.datasets.lerobot import relative_action_to_absolute_eef_pose
 from ffs.policies.stereo_action_policy import build_policy
+from ffs.visualization import (
+    default_query_attention_config,
+    render_query_attention_frames,
+    save_query_attention_video,
+)
 from scripts.train import autocast_context
 
 
@@ -32,15 +37,18 @@ def make_loader(cfg: dict[str, Any], batch_size: int | None, num_workers: int | 
     policy_cfg = cfg["policy"]
     dataset_cfg = cfg["dataset"]
     train_cfg = cfg.get("train", {})
-    dataset = LeRobotStereoDataset(
-        root=dataset_cfg["root"],
-        camera_pairs=dataset_cfg["camera_pairs"],
-        num_history_frames=policy_cfg["num_history_frames"],
-        action_horizon=policy_cfg["action_horizon"],
-        image_size=dataset_cfg.get("image_size"),
-        episode_indices=dataset_cfg.get("episode_indices"),
-        action_normalization=dataset_cfg.get("action_normalization"),
-    )
+    dataset_kwargs = {
+        "camera_pairs": dataset_cfg["camera_pairs"],
+        "num_history_frames": policy_cfg["num_history_frames"],
+        "action_horizon": policy_cfg["action_horizon"],
+        "image_size": dataset_cfg.get("image_size"),
+        "episode_indices": dataset_cfg.get("episode_indices"),
+        "action_normalization": dataset_cfg.get("action_normalization"),
+    }
+    if dataset_cfg.get("roots") is not None:
+        dataset = MultiLeRobotStereoDataset(roots=dataset_cfg["roots"], **dataset_kwargs)
+    else:
+        dataset = LeRobotStereoDataset(root=dataset_cfg["root"], **dataset_kwargs)
     if int(policy_cfg["state_dim"]) != dataset.state_dim:
         raise ValueError(
             f"policy.state_dim={policy_cfg['state_dim']} does not match dataset state_dim={dataset.state_dim}"
@@ -67,7 +75,39 @@ def load_model(cfg: dict[str, Any], checkpoint_path: str | Path, device: torch.d
     return model
 
 
-def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
+def resolve_query_attention_config(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
+    configured = cfg.get("visualization", {}).get("query_attention", {})
+    query_cfg = default_query_attention_config(configured)
+    if args.visualize_query_attention:
+        query_cfg["enabled"] = True
+    for key, attr in {
+        "mode": "query_attention_mode",
+        "sources": "query_attention_sources",
+        "view": "query_attention_view",
+        "time": "query_attention_time",
+        "query": "query_attention_query",
+    }.items():
+        value = getattr(args, attr, None)
+        if value is not None:
+            query_cfg[key] = value
+    if args.query_attention_max_frames is not None:
+        query_cfg["max_frames"] = args.query_attention_max_frames
+    if args.query_attention_fps is not None:
+        query_cfg["fps"] = args.query_attention_fps
+    if args.query_attention_alpha is not None:
+        query_cfg["alpha"] = args.query_attention_alpha
+    return query_cfg
+
+
+def query_attention_output_path(args: argparse.Namespace) -> Path:
+    if args.query_attention_output_dir:
+        root = Path(args.query_attention_output_dir)
+    else:
+        root = Path(args.checkpoint).resolve().parent / "query_attention"
+    return root / "query_attention.mp4"
+
+
+def evaluate(args: argparse.Namespace) -> dict[str, float | int | str | list[str]]:
     os.environ.setdefault("IMAGEIO_FFMPEG_EXE", "ffmpeg")
     if args.seed is not None:
         torch.manual_seed(args.seed)
@@ -76,7 +116,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
 
     cfg, config_source = load_config_for_checkpoint(args.checkpoint, args.config)
     if args.dataset_root:
+        cfg["dataset"].pop("roots", None)
         cfg["dataset"]["root"] = args.dataset_root
+    cfg.setdefault("policy", {})["disparity_ablation"] = args.disparity_ablation
     if args.suppress_dynamo_errors:
         dynamo = importlib.import_module("torch._dynamo")
         dynamo.config.suppress_errors = True
@@ -88,6 +130,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
     loader = make_loader(cfg, args.batch_size, args.num_workers)
     model = load_model(cfg, args.checkpoint, device)
     model.eval()
+    query_attention_cfg = resolve_query_attention_config(args, cfg)
+    query_attention_frames = []
 
     if args.sample_init is not None and hasattr(model.action_head, "sample_init"):
         model.action_head.sample_init = args.sample_init
@@ -116,7 +160,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
             absolute_action = batch["absolute_action"].to(device, non_blocking=True)
 
             with autocast_context(device, use_amp):
-                pred = model(left, right, state)
+                if query_attention_cfg["enabled"] and len(query_attention_frames) < int(query_attention_cfg["max_frames"]):
+                    pred, attention = model(left, right, state, return_attention=True)
+                else:
+                    pred = model(left, right, state)
+                    attention = None
                 normalized_mse = F.mse_loss(pred, action, reduction="sum")
                 normalized_mae = F.l1_loss(pred, action, reduction="sum")
                 pred_relative = dataset.denormalize_action(pred.float())
@@ -134,6 +182,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
             relative_mae_sum += float(relative_mae.detach().cpu())
             absolute_mse_sum += float(absolute_mse.detach().cpu())
             absolute_mae_sum += float(absolute_mae.detach().cpu())
+
+            if attention is not None:
+                remaining = int(query_attention_cfg["max_frames"]) - len(query_attention_frames)
+                frames = render_query_attention_frames(left, attention, query_attention_cfg)
+                query_attention_frames.extend(frames[:remaining])
 
             if args.log_interval and (batch_idx + 1) % args.log_interval == 0:
                 running_normalized_mse = normalized_mse_sum / max(total_elements, 1)
@@ -153,10 +206,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
     normalized_mse = normalized_mse_sum / total_elements
     relative_mse = relative_mse_sum / total_elements
     absolute_mse = absolute_mse_sum / total_elements
-    return {
+    dataset_roots = cfg["dataset"].get("roots") or [cfg["dataset"]["root"]]
+    metrics = {
         "checkpoint": str(args.checkpoint),
         "config_source": config_source,
-        "dataset_root": str(cfg["dataset"]["root"]),
+        "disparity_ablation": args.disparity_ablation,
+        "dataset_root": ", ".join(str(root) for root in dataset_roots),
+        "dataset_roots": [str(root) for root in dataset_roots],
         "samples": total_samples,
         "action_elements": total_elements,
         "mse": normalized_mse,
@@ -172,12 +228,22 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str]:
         "absolute_rmse": absolute_mse**0.5,
         "absolute_mae": absolute_mae_sum / total_elements,
     }
+    if query_attention_cfg["enabled"] and query_attention_frames:
+        output_path = query_attention_output_path(args)
+        save_query_attention_video(
+            query_attention_frames,
+            output_path,
+            fps=int(query_attention_cfg["fps"]),
+        )
+        metrics["query_attention_video"] = str(output_path)
+        metrics["query_attention_frames"] = len(query_attention_frames)
+    return metrics
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None)
-    parser.add_argument("--checkpoint", default="outputs/rdt_version_1_clean/latest.pt")
+    parser.add_argument("--checkpoint", default="outputs/rdt_v1_mixed/latest.pt")
     parser.add_argument("--dataset-root", default=None)
     parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=None)
@@ -186,8 +252,19 @@ def main() -> None:
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-init", choices=["randn", "zeros"], default=None)
+    parser.add_argument("--disparity-ablation", choices=["none", "zero", "shuffle"], default="none")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--suppress-dynamo-errors", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--visualize-query-attention", action="store_true")
+    parser.add_argument("--query-attention-output-dir", default=None)
+    parser.add_argument("--query-attention-mode", choices=["all", "single"], default=None)
+    parser.add_argument("--query-attention-sources", default=None)
+    parser.add_argument("--query-attention-view", default=None)
+    parser.add_argument("--query-attention-time", default=None)
+    parser.add_argument("--query-attention-query", default=None)
+    parser.add_argument("--query-attention-max-frames", type=int, default=None)
+    parser.add_argument("--query-attention-fps", type=int, default=None)
+    parser.add_argument("--query-attention-alpha", type=float, default=None)
     args = parser.parse_args()
 
     metrics = evaluate(args)

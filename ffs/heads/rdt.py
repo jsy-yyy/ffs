@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import math
+import re
+from collections import OrderedDict
 from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import LogisticNormal
 
 from .base import ActionHead
 
@@ -21,65 +24,78 @@ def _as_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return value
 
 
-def _sincos_pos_embed(length: int, dim: int) -> torch.Tensor:
-    half = dim // 2
-    freqs = torch.exp(
-        -math.log(10000) * torch.arange(half, dtype=torch.float32) / max(half, 1)
-    )
-    pos = torch.arange(length, dtype=torch.float32).unsqueeze(1)
-    emb = torch.cat([torch.sin(pos * freqs), torch.cos(pos * freqs)], dim=1)
-    if dim % 2:
-        emb = F.pad(emb, (0, 1))
-    return emb
-
-
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 
-class FlowMatchScheduler:
-    """Small inference scheduler matching the RDT flow-matching update."""
+def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor) -> torch.Tensor:
+    if embed_dim % 2 != 0:
+        raise ValueError("RDT positional embeddings require an even hidden_size.")
+    omega = torch.arange(embed_dim // 2, dtype=torch.float64)
+    omega = 1.0 / (10000 ** (omega / (embed_dim / 2.0)))
+    out = pos.reshape(-1).to(torch.float64).unsqueeze(1) * omega.unsqueeze(0)
+    return torch.cat([torch.sin(out), torch.cos(out)], dim=1).float()
 
-    def __init__(
-        self,
-        num_inference_steps: int = 10,
-        num_train_timesteps: int = 1000,
-        shift: float = 3.0,
-        sigma_max: float = 1.0,
-        sigma_min: float = 0.003 / 1.002,
-        extra_one_step: bool = True,
-    ) -> None:
-        self.num_train_timesteps = num_train_timesteps
-        self.shift = shift
-        self.sigma_max = sigma_max
-        self.sigma_min = sigma_min
-        self.extra_one_step = extra_one_step
-        self.set_timesteps(num_inference_steps)
 
-    def set_timesteps(self, num_inference_steps: int) -> None:
-        sigma_start = self.sigma_max
-        if self.extra_one_step:
-            sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps + 1)[:-1]
+def _multimodal_pos_embed(embed_dim: int, mm_lens: OrderedDict[str, int]) -> torch.Tensor:
+    total_len = sum(abs(length) for length in mm_lens.values())
+    pos_emb = torch.zeros(total_len, embed_dim, dtype=torch.float32)
+    modality_emb = None
+    if len(mm_lens) > 1:
+        modality_emb = _get_1d_sincos_pos_embed(
+            embed_dim,
+            torch.arange(len(mm_lens), dtype=torch.float32),
+        )
+
+    start = 0
+    for idx, (_, length) in enumerate(mm_lens.items()):
+        abs_len = abs(length)
+        if length > 1:
+            emb = _get_1d_sincos_pos_embed(
+                embed_dim,
+                torch.arange(length, dtype=torch.float32),
+            )
         else:
-            sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps)
-        self.sigmas = self.shift * sigmas / (1 + (self.shift - 1) * sigmas)
-        self.timesteps = self.sigmas * self.num_train_timesteps
+            emb = torch.zeros(abs_len, embed_dim, dtype=torch.float32)
+        if modality_emb is not None:
+            emb = emb + modality_emb[idx]
+        pos_emb[start : start + abs_len] = emb
+        start += abs_len
+    return pos_emb
 
-    def step(self, model_output: torch.Tensor, timestep: torch.Tensor, sample: torch.Tensor, to_final: bool) -> torch.Tensor:
-        timestep_value = timestep.flatten()[0].detach().cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep_value).abs())
-        sigma = self.sigmas[timestep_id].to(sample.device, sample.dtype)
-        if to_final or timestep_id + 1 >= len(self.timesteps):
-            sigma_next = torch.zeros((), device=sample.device, dtype=sample.dtype)
-        else:
-            sigma_next = self.sigmas[timestep_id + 1].to(sample.device, sample.dtype)
-        return sample + model_output * (sigma_next - sigma)
+
+def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, seq_len, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(batch, seq_len, n_kv_heads, n_rep, head_dim)
+        .reshape(batch, seq_len, n_kv_heads * n_rep, head_dim)
+    )
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return out.type_as(x) * self.weight
 
 
 class TimestepEmbedder(nn.Module):
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
+        self.dtype = dtype
         self.mlp = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size),
             nn.SiLU(),
@@ -89,40 +105,213 @@ class TimestepEmbedder(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(
-            -math.log(10000) * torch.arange(half, dtype=torch.float32, device=t.device) / half
+            -math.log(10000)
+            * torch.arange(half, dtype=torch.float32, device=t.device)
+            / half
         )
         args = t[:, None].float() * freqs[None]
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if self.frequency_embedding_size % 2:
             emb = F.pad(emb, (0, 1))
-        return self.mlp(emb.to(next(self.mlp.parameters()).dtype))
+        return self.mlp(emb.to(dtype=self.dtype))
 
 
-class RDTBlock(nn.Module):
-    """RDT-style block with adaLN, self-attention, and cross-attention."""
-
+class Attention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        norm_eps: float = 1e-5,
+        num_kv_heads: int | None,
+        norm_eps: float,
+        use_flash_attn: bool,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads.")
+        if hidden_size % self.num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads.")
+
+        self.hidden_size = hidden_size
+        self.head_size = hidden_size // num_heads
+        self.num_repeats = self.num_heads // self.num_kv_heads
+        self.use_flash_attn = use_flash_attn
+        self.attn_scale = 1.0 / math.sqrt(self.head_size)
+
+        self.wq = nn.Linear(hidden_size, self.num_heads * self.head_size, bias=False)
+        self.wkv = nn.Linear(hidden_size, self.num_kv_heads * self.head_size * 2, bias=False)
+        self.wo = nn.Linear(self.num_heads * self.head_size, hidden_size, bias=False)
+        self.norm_q = RMSNorm(self.head_size, eps=norm_eps)
+        self.norm_k = RMSNorm(self.head_size, eps=norm_eps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        xq = self.wq(x).view(batch, seq_len, self.num_heads, self.head_size)
+        xkv = self.wkv(x).view(batch, seq_len, self.num_kv_heads, self.head_size, 2)
+        xk, xv = xkv.unbind(-1)
+
+        xq = self.norm_q(xq)
+        xk = self.norm_k(xk)
+        xk = _repeat_kv(xk, self.num_repeats)
+        xv = _repeat_kv(xv, self.num_repeats)
+
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        if self.use_flash_attn:
+            out = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.attn_scale,
+            )
+        else:
+            scores = torch.matmul(xq, xk.transpose(2, 3)) * self.attn_scale
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            out = torch.matmul(scores, xv)
+
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.wo(out)
+
+
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int | None,
+        norm_eps: float,
+        use_flash_attn: bool,
+    ) -> None:
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads.")
+        if hidden_size % self.num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads.")
+
+        self.hidden_size = hidden_size
+        self.head_size = hidden_size // num_heads
+        self.num_repeats = self.num_heads // self.num_kv_heads
+        self.use_flash_attn = use_flash_attn
+        self.attn_scale = 1.0 / math.sqrt(self.head_size)
+
+        self.wq = nn.Linear(hidden_size, self.num_heads * self.head_size, bias=False)
+        self.wkv = nn.Linear(hidden_size, self.num_kv_heads * self.head_size * 2, bias=False)
+        self.wo = nn.Linear(self.num_heads * self.head_size, hidden_size, bias=False)
+        self.norm_q = RMSNorm(self.head_size, eps=norm_eps)
+        self.norm_k = RMSNorm(self.head_size, eps=norm_eps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        _, cond_len, _ = c.shape
+
+        xq = self.wq(x).view(batch, seq_len, self.num_heads, self.head_size)
+        ckv = self.wkv(c).view(batch, cond_len, self.num_kv_heads, self.head_size, 2)
+        ck, cv = ckv.unbind(-1)
+
+        xq = self.norm_q(xq)
+        ck = self.norm_k(ck)
+        ck = _repeat_kv(ck, self.num_repeats)
+        cv = _repeat_kv(cv, self.num_repeats)
+
+        xq = xq.transpose(1, 2)
+        ck = ck.transpose(1, 2)
+        cv = cv.transpose(1, 2)
+
+        attn_mask = None
+        if mask is not None:
+            attn_mask = mask.reshape(batch, 1, 1, cond_len).expand(-1, -1, seq_len, -1)
+
+        if self.use_flash_attn:
+            out = F.scaled_dot_product_attention(
+                xq,
+                ck,
+                cv,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.attn_scale,
+            )
+        else:
+            scores = torch.matmul(xq, ck.transpose(2, 3)) * self.attn_scale
+            if attn_mask is not None:
+                scores = scores.masked_fill(attn_mask.logical_not(), float("-inf"))
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            out = torch.matmul(scores, cv)
+
+        out = out.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        return self.wo(out)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: float | None,
+    ) -> None:
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class RDTBlock(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int | None,
+        norm_eps: float,
+        multiple_of: int,
+        ffn_dim_multiplier: float | None,
+        use_flash_attn: bool,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        self.self_norm = nn.LayerNorm(hidden_size, eps=norm_eps)
-        self.cross_norm = nn.LayerNorm(hidden_size, eps=norm_eps)
-        self.cond_norm = nn.LayerNorm(hidden_size, eps=norm_eps)
-        self.ffn_norm = nn.LayerNorm(hidden_size, eps=norm_eps)
-        self.self_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
-        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout, batch_first=True)
-        mlp_hidden = int(hidden_size * mlp_ratio)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, mlp_hidden),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden, hidden_size),
+        self.attn_norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.attn = Attention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            norm_eps=norm_eps,
+            use_flash_attn=use_flash_attn,
+        )
+        self.cross_norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.cond_norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.cross_attn = CrossAttention(
+            hidden_size=hidden_size,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            norm_eps=norm_eps,
+            use_flash_attn=use_flash_attn,
+        )
+        self.ffn_norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.ffn = FeedForward(
+            dim=hidden_size,
+            hidden_dim=4 * hidden_size,
+            multiple_of=multiple_of,
+            ffn_dim_multiplier=ffn_dim_multiplier,
         )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
@@ -140,35 +329,63 @@ class RDTBlock(nn.Module):
             self.adaLN_modulation(t_state).chunk(9, dim=1)
         )
 
-        self_in = _modulate(self.self_norm(x), shift_attn, scale_attn)
-        self_out = self.self_attn(self_in, self_in, self_in, need_weights=False)[0]
-        x = x + gate_attn.unsqueeze(1) * self_out
+        h = x + gate_attn.unsqueeze(1) * self.attn(
+            _modulate(self.attn_norm(x), shift_attn, scale_attn)
+        )
+        h = h + gate_cross.unsqueeze(1) * self.cross_attn(
+            _modulate(self.cross_norm(h), shift_cross, scale_cross),
+            c=self.cond_norm(condition),
+            mask=condition_mask,
+        )
+        return h + gate_mlp.unsqueeze(1) * self.ffn(
+            _modulate(self.ffn_norm(h), shift_mlp, scale_mlp)
+        )
 
-        key_padding_mask = None
-        if condition_mask is not None:
-            key_padding_mask = ~condition_mask
-        cross_in = _modulate(self.cross_norm(x), shift_cross, scale_cross)
-        cond = self.cond_norm(condition)
-        cross_out = self.cross_attn(
-            cross_in,
-            cond,
-            cond,
-            key_padding_mask=key_padding_mask,
-            need_weights=False,
-        )[0]
-        x = x + gate_cross.unsqueeze(1) * cross_out
 
-        ffn_in = _modulate(self.ffn_norm(x), shift_mlp, scale_mlp)
-        return x + gate_mlp.unsqueeze(1) * self.ffn(ffn_in)
+class FinalLayer(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        output_size: int,
+        norm_eps: float,
+    ) -> None:
+        super().__init__()
+        self.ffn_norm = RMSNorm(hidden_size, eps=norm_eps)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.SiLU(),
+            nn.Linear(hidden_size * 4, output_size),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size * 2, hidden_size * 2),
+        )
+
+    def forward(self, x: torch.Tensor, t_state: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(t_state).chunk(2, dim=1)
+        return self.ffn(_modulate(self.ffn_norm(x), shift, scale))
+
+
+def _build_adapter(projector_type: str, in_features: int, out_features: int) -> nn.Module:
+    if projector_type == "linear":
+        return nn.Linear(in_features, out_features)
+
+    mlp_silu_match = re.match(r"^mlp(\d+)x_silu$", projector_type)
+    if mlp_silu_match is not None:
+        depth = int(mlp_silu_match.group(1))
+        if depth < 1:
+            raise ValueError(f"Invalid projector depth in '{projector_type}'.")
+        layers: list[nn.Module] = [nn.Linear(in_features, out_features)]
+        for _ in range(1, depth):
+            layers.append(nn.SiLU())
+            layers.append(nn.Linear(out_features, out_features))
+        return nn.Sequential(*layers)
+
+    raise ValueError(f"Unknown projector type: {projector_type}")
 
 
 class RDTActionHead(ActionHead):
-    """RDT-style denoising action head conditioned on stereo tokens.
-
-    This follows the open-p2p RDT head pattern: action tokens are iteratively
-    denoised with flow matching while cross-attending to projected condition
-    tokens and using timestep/state conditioning through adaLN.
-    """
+    """RDT2-style action expert conditioned on FoundationStereo tokens."""
 
     def __init__(
         self,
@@ -177,20 +394,22 @@ class RDTActionHead(ActionHead):
         action_horizon: int,
         frame_token_dim: int | None = None,
         condition_len: int | None = None,
+        num_history_frames: int | None = None,
+        tokens_per_frame: int | None = None,
         hidden_size: int = 256,
         depth: int = 4,
         num_heads: int = 8,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
+        num_kv_heads: int | None = None,
         norm_eps: float = 1e-5,
+        multiple_of: int = 256,
+        ffn_dim_multiplier: float | None = None,
+        use_flash_attn: bool = True,
         num_register_tokens: int = 4,
-        num_train_timesteps: int = 1000,
         num_inference_steps: int = 10,
-        flow_match_shift: float = 3.0,
-        sigma_max: float = 1.0,
-        sigma_min: float = 0.003 / 1.002,
-        extra_one_step: bool = True,
         sample_init: Literal["randn", "zeros"] = "randn",
+        act_adaptor: str = "mlp3x_silu",
+        state_adaptor: str = "mlp3x_silu",
+        img_adaptor: str = "linear",
         dtype: str | torch.dtype = torch.float32,
     ) -> None:
         super().__init__(input_dim=input_dim, action_dim=action_dim, action_horizon=action_horizon)
@@ -204,48 +423,74 @@ class RDTActionHead(ActionHead):
             frame_token_dim = input_dim // condition_len
         if hidden_size % num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_heads.")
+        if num_kv_heads is not None and num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads.")
         if sample_init not in ("randn", "zeros"):
             raise ValueError("sample_init must be 'randn' or 'zeros'.")
-
+            
         self.frame_token_dim = frame_token_dim
         self.condition_len = condition_len
         self.hidden_size = hidden_size
         self.num_register_tokens = num_register_tokens
+        self.num_inference_steps = num_inference_steps
         self.sample_init = sample_init
         self.param_dtype = _as_dtype(dtype)
 
-        self.condition_proj = nn.Linear(frame_token_dim, hidden_size)
-        self.state_proj = nn.Linear(frame_token_dim, hidden_size)
-        self.action_embedder = nn.Linear(action_dim, hidden_size)
-        self.action_decoder = nn.Linear(hidden_size, action_dim)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        if tokens_per_frame is None and num_history_frames is not None:
+            if condition_len % num_history_frames != 0:
+                raise ValueError("condition_len must be divisible by num_history_frames.")
+            tokens_per_frame = condition_len // num_history_frames
+        if tokens_per_frame is not None and tokens_per_frame <= 0:
+            raise ValueError("tokens_per_frame must be positive.")
+        self.num_history_frames = num_history_frames
+        self.tokens_per_frame = tokens_per_frame
+
+        self.t_embedder = TimestepEmbedder(hidden_size, dtype=self.param_dtype)
+        self.act_adaptor = _build_adapter(act_adaptor, action_dim, hidden_size)
+        self.state_adaptor = _build_adapter(state_adaptor, frame_token_dim, hidden_size)
+        self.img_adaptor = _build_adapter(img_adaptor, frame_token_dim, hidden_size)
         self.blocks = nn.ModuleList(
             [
                 RDTBlock(
                     hidden_size=hidden_size,
                     num_heads=num_heads,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
+                    num_kv_heads=num_kv_heads,
                     norm_eps=norm_eps,
+                    multiple_of=multiple_of,
+                    ffn_dim_multiplier=ffn_dim_multiplier,
+                    use_flash_attn=use_flash_attn,
                 )
                 for _ in range(depth)
             ]
         )
+        self.final_layer = FinalLayer(
+            hidden_size=hidden_size,
+            output_size=action_dim,
+            norm_eps=norm_eps,
+        )
         self.register_tokens = nn.Parameter(torch.randn(1, num_register_tokens, hidden_size))
         self.x_pos_emb = nn.Parameter(
-            _sincos_pos_embed(action_horizon + num_register_tokens, hidden_size).unsqueeze(0)
+            _multimodal_pos_embed(
+                hidden_size,
+                OrderedDict(
+                    [
+                        ("action", action_horizon),
+                        ("register", num_register_tokens),
+                    ]
+                ),
+            ).unsqueeze(0)
         )
-        self.condition_pos_emb = nn.Parameter(
-            _sincos_pos_embed(condition_len, hidden_size).unsqueeze(0)
+        max_img_len = max(condition_len - 1, 1)
+        self.img_pos_emb = nn.Parameter(
+            _multimodal_pos_embed(
+                hidden_size,
+                OrderedDict([("image", max_img_len)]),
+            ).unsqueeze(0)
         )
-        self.scheduler = FlowMatchScheduler(
-            num_inference_steps=num_inference_steps,
-            num_train_timesteps=num_train_timesteps,
-            shift=flow_match_shift,
-            sigma_max=sigma_max,
-            sigma_min=sigma_min,
-            extra_one_step=extra_one_step,
+        self.state_pos_emb = nn.Parameter(
+            _multimodal_pos_embed(hidden_size, OrderedDict([("state", 1)])).unsqueeze(0)
         )
+        self.timestep_sampler = LogisticNormal(0, 1)
 
         self.initialize_weights()
         self.to(self.param_dtype)
@@ -259,9 +504,26 @@ class RDTActionHead(ActionHead):
 
         self.apply(init_module)
         nn.init.normal_(self.register_tokens, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
         for block in self.blocks:
             nn.init.zeros_(block.adaLN_modulation[-1].weight)
             nn.init.zeros_(block.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_layer.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.final_layer.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_layer.ffn[-1].weight)
+        nn.init.zeros_(self.final_layer.ffn[-1].bias)
+
+    def _state_token_indices(self, device: torch.device) -> torch.Tensor:
+        if self.tokens_per_frame is None:
+            return torch.tensor([self.condition_len - 1], device=device, dtype=torch.long)
+        return torch.arange(
+            self.tokens_per_frame - 1,
+            self.condition_len,
+            self.tokens_per_frame,
+            device=device,
+            dtype=torch.long,
+        )
 
     def _initial_sample(self, frame_tokens: torch.Tensor) -> torch.Tensor:
         shape = (frame_tokens.shape[0], self.action_horizon, self.action_dim)
@@ -269,7 +531,7 @@ class RDTActionHead(ActionHead):
             return torch.zeros(shape, device=frame_tokens.device, dtype=self.param_dtype)
         return torch.randn(shape, device=frame_tokens.device, dtype=self.param_dtype)
 
-    def _prepare_condition(self, frame_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _prepare_conditions(self, frame_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if frame_tokens.shape[1] != self.condition_len:
             raise ValueError(
                 f"RDTActionHead expected {self.condition_len} condition tokens, got {frame_tokens.shape[1]}."
@@ -280,72 +542,86 @@ class RDTActionHead(ActionHead):
             )
 
         tokens = frame_tokens.to(self.param_dtype)
-        condition = self.condition_proj(tokens) + self.condition_pos_emb[:, : tokens.shape[1]]
-        state_token = self.state_proj(tokens[:, -1:, :])
-        return condition, state_token
+        state_indices = self._state_token_indices(tokens.device)
+        state_tokens = tokens.index_select(1, state_indices)
+        state_token = state_tokens[:, -1:, :]
 
-    def _predict_denoising_target(
+        cond_mask = torch.ones(tokens.shape[1], device=tokens.device, dtype=torch.bool)
+        cond_mask[state_indices] = False
+        img_tokens = tokens[:, cond_mask, :]
+        if img_tokens.shape[1] == 0:
+            raise ValueError("RDTActionHead needs at least one non-state condition token.")
+
+        img_cond = self.img_adaptor(img_tokens)
+        img_cond = img_cond + self.img_pos_emb[:, : img_cond.shape[1]]
+        state_cond = self.state_adaptor(state_token) + self.state_pos_emb
+        img_mask = torch.ones(
+            (tokens.shape[0], img_cond.shape[1]),
+            device=tokens.device,
+            dtype=torch.bool,
+        )
+        return img_cond, state_cond, img_mask
+
+    def _predict_velocity(
         self,
-        sample: torch.Tensor,
+        noisy_action: torch.Tensor,
         timestep: torch.Tensor,
-        condition: torch.Tensor,
-        state_token: torch.Tensor,
+        img_cond: torch.Tensor,
+        state_cond: torch.Tensor,
+        img_mask: torch.Tensor,
     ) -> torch.Tensor:
-        b = sample.shape[0]
-        x = self.action_embedder(sample)
-        r = self.register_tokens.expand(b, -1, -1)
+        x = self.act_adaptor(noisy_action.to(self.param_dtype))
+        t = self.t_embedder(timestep.to(device=noisy_action.device))
+        if t.shape[0] == 1:
+            t = t.expand(x.shape[0], -1)
+
+        t_state = torch.cat([t.unsqueeze(1), state_cond], dim=1).reshape(x.shape[0], self.hidden_size * 2)
+        r = self.register_tokens.expand(x.shape[0], -1, -1)
         x = torch.cat([x, r], dim=1) + self.x_pos_emb
 
-        t = self.t_embedder(timestep)
-        t_state = torch.cat([t, state_token.squeeze(1)], dim=1)
         for block in self.blocks:
-            x = block(x=x, t_state=t_state, condition=condition)
-        x = x[:, : self.action_horizon]
-        return self.action_decoder(x)
+            x = block(
+                x=x,
+                t_state=t_state,
+                condition=img_cond,
+                condition_mask=img_mask,
+            )
+        x = self.final_layer(x, t_state)
+        return x[:, : self.action_horizon]
 
     def training_loss(self, frame_tokens: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        condition, state_token = self._prepare_condition(frame_tokens)
+        img_cond, state_cond, img_mask = self._prepare_conditions(frame_tokens)
         action = action.to(self.param_dtype)
         noise = torch.randn_like(action)
-
-        raw_sigma = torch.rand(action.shape[0], device=action.device, dtype=action.dtype)
-        raw_sigma = self.scheduler.sigma_min + raw_sigma * (self.scheduler.sigma_max - self.scheduler.sigma_min)
-        sigma = self.scheduler.shift * raw_sigma / (1 + (self.scheduler.shift - 1) * raw_sigma)
-        timestep = (sigma * self.scheduler.num_train_timesteps).to(torch.float32)
-        sigma = sigma.view(-1, 1, 1)
-
-        noisy_action = sigma * noise + (1 - sigma) * action
-        target = noise - action
-        pred = self._predict_denoising_target(
-            sample=noisy_action,
-            timestep=timestep,
-            condition=condition,
-            state_token=state_token,
+        timesteps = self.timestep_sampler.sample((action.shape[0],))[:, 0].to(
+            device=action.device,
+            dtype=action.dtype,
         )
-        return F.mse_loss(pred, target)
+        noisy_action = action * timesteps.view(-1, 1, 1) + noise * (1 - timesteps.view(-1, 1, 1))
+        pred = self._predict_velocity(
+            noisy_action=noisy_action,
+            timestep=timesteps,
+            img_cond=img_cond,
+            state_cond=state_cond,
+            img_mask=img_mask,
+        )
+        return F.mse_loss(pred, action - noise)
 
     def forward(self, frame_tokens: torch.Tensor) -> torch.Tensor:
-        condition, state_token = self._prepare_condition(frame_tokens)
-        sample = self._initial_sample(frame_tokens)
-        timesteps = self.scheduler.timesteps.to(frame_tokens.device)
+        img_cond, state_cond, img_mask = self._prepare_conditions(frame_tokens)
+        noisy_action = self._initial_sample(frame_tokens)
+        timestep = torch.tensor([0.0], device=frame_tokens.device, dtype=self.param_dtype)
+        step_size = 1.0 / self.num_inference_steps
 
-        for step_idx, timestep in enumerate(timesteps):
-            timestep_batch = torch.full(
-                (frame_tokens.shape[0],),
-                float(timestep.item()),
-                dtype=torch.float32,
-                device=frame_tokens.device,
+        for _ in range(self.num_inference_steps):
+            pred = self._predict_velocity(
+                noisy_action=noisy_action,
+                timestep=timestep,
+                img_cond=img_cond,
+                state_cond=state_cond,
+                img_mask=img_mask,
             )
-            model_output = self._predict_denoising_target(
-                sample=sample,
-                timestep=timestep_batch,
-                condition=condition,
-                state_token=state_token,
-            )
-            sample = self.scheduler.step(
-                model_output=model_output,
-                timestep=timestep_batch,
-                sample=sample,
-                to_final=(step_idx + 1 == len(timesteps)),
-            )
-        return sample.to(frame_tokens.dtype)
+            noisy_action = noisy_action + pred * step_size
+            timestep = timestep + step_size
+
+        return noisy_action.to(frame_tokens.dtype)
