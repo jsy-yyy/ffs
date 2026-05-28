@@ -87,7 +87,11 @@ def evaluate_model(
     relative_mae_sum = 0.0
     absolute_mse_sum = 0.0
     absolute_mae_sum = 0.0
+    raw_mse_sum = 0.0
+    raw_mae_sum = 0.0
     dataset = loader.dataset
+    action_mode = getattr(dataset, "action_mode", None)
+    is_robotwin = action_mode == "relative-eef"
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
@@ -98,48 +102,66 @@ def evaluate_model(
             right = batch["right"].to(device, non_blocking=True)
             state = batch["state"].to(device, non_blocking=True)
             action = batch["action"].to(device, non_blocking=True)
-            relative_action = batch["relative_action"].to(device, non_blocking=True)
-            absolute_action = batch["absolute_action"].to(device, non_blocking=True)
+            if is_robotwin:
+                relative_action = batch["relative_action"].to(device, non_blocking=True)
+                absolute_action = batch["absolute_action"].to(device, non_blocking=True)
+            else:
+                raw_action = batch["raw_action"].to(device, non_blocking=True)
 
             with autocast_context(device, use_amp):
                 pred = model(left, right, state)
                 normalized_mse = F.mse_loss(pred, action, reduction="sum")
                 normalized_mae = F.l1_loss(pred, action, reduction="sum")
-                pred_relative = dataset.denormalize_action(pred.float())
-                relative_mse = F.mse_loss(pred_relative, relative_action.float(), reduction="sum")
-                relative_mae = F.l1_loss(pred_relative, relative_action.float(), reduction="sum")
-                absolute_pred = relative_action_to_absolute_eef_pose(pred_relative, state[:, -1].float())
-                absolute_mse = F.mse_loss(absolute_pred, absolute_action.float(), reduction="sum")
-                absolute_mae = F.l1_loss(absolute_pred, absolute_action.float(), reduction="sum")
+                pred_denorm = dataset.denormalize_action(pred.float())
+                if is_robotwin:
+                    relative_mse = F.mse_loss(pred_denorm, relative_action.float(), reduction="sum")
+                    relative_mae = F.l1_loss(pred_denorm, relative_action.float(), reduction="sum")
+                    absolute_pred = relative_action_to_absolute_eef_pose(pred_denorm, state[:, -1].float())
+                    absolute_mse = F.mse_loss(absolute_pred, absolute_action.float(), reduction="sum")
+                    absolute_mae = F.l1_loss(absolute_pred, absolute_action.float(), reduction="sum")
+                else:
+                    raw_mse = F.mse_loss(pred_denorm, raw_action.float(), reduction="sum")
+                    raw_mae = F.l1_loss(pred_denorm, raw_action.float(), reduction="sum")
 
             total_elements += action.numel()
             total_samples += action.shape[0]
             normalized_mse_sum += float(normalized_mse.detach().cpu())
             normalized_mae_sum += float(normalized_mae.detach().cpu())
-            relative_mse_sum += float(relative_mse.detach().cpu())
-            relative_mae_sum += float(relative_mae.detach().cpu())
-            absolute_mse_sum += float(absolute_mse.detach().cpu())
-            absolute_mae_sum += float(absolute_mae.detach().cpu())
+            if is_robotwin:
+                relative_mse_sum += float(relative_mse.detach().cpu())
+                relative_mae_sum += float(relative_mae.detach().cpu())
+                absolute_mse_sum += float(absolute_mse.detach().cpu())
+                absolute_mae_sum += float(absolute_mae.detach().cpu())
+            else:
+                raw_mse_sum += float(raw_mse.detach().cpu())
+                raw_mae_sum += float(raw_mae.detach().cpu())
 
             if log_interval and (batch_idx + 1) % log_interval == 0:
                 running_normalized_mse = normalized_mse_sum / max(total_elements, 1)
-                running_relative_mse = relative_mse_sum / max(total_elements, 1)
-                running_absolute_mse = absolute_mse_sum / max(total_elements, 1)
-                print(
-                    f"{name}: batch={batch_idx + 1} samples={total_samples} "
-                    f"normalized_mse={running_normalized_mse:.8f} "
-                    f"relative_mse={running_relative_mse:.8f} "
-                    f"absolute_mse={running_absolute_mse:.8f}",
-                    flush=True,
-                )
+                if is_robotwin:
+                    running_relative_mse = relative_mse_sum / max(total_elements, 1)
+                    running_absolute_mse = absolute_mse_sum / max(total_elements, 1)
+                    print(
+                        f"{name}: batch={batch_idx + 1} samples={total_samples} "
+                        f"normalized_mse={running_normalized_mse:.8f} "
+                        f"relative_mse={running_relative_mse:.8f} "
+                        f"absolute_mse={running_absolute_mse:.8f}",
+                        flush=True,
+                    )
+                else:
+                    running_raw_mse = raw_mse_sum / max(total_elements, 1)
+                    print(
+                        f"{name}: batch={batch_idx + 1} samples={total_samples} "
+                        f"normalized_mse={running_normalized_mse:.8f} "
+                        f"raw_mse={running_raw_mse:.8f}",
+                        flush=True,
+                    )
 
     if total_elements == 0:
         raise RuntimeError(f"No evaluation batches were processed for {name}.")
 
     normalized_mse = normalized_mse_sum / total_elements
-    relative_mse = relative_mse_sum / total_elements
-    absolute_mse = absolute_mse_sum / total_elements
-    return {
+    metrics = {
         "config": str(config_path) if config_path is not None else None,
         "config_source": config_source,
         "checkpoint": str(checkpoint_path),
@@ -154,13 +176,30 @@ def evaluate_model(
         "normalized_mse": normalized_mse,
         "normalized_rmse": normalized_mse**0.5,
         "normalized_mae": normalized_mae_sum / total_elements,
-        "relative_mse": relative_mse,
-        "relative_rmse": relative_mse**0.5,
-        "relative_mae": relative_mae_sum / total_elements,
-        "absolute_mse": absolute_mse,
-        "absolute_rmse": absolute_mse**0.5,
-        "absolute_mae": absolute_mae_sum / total_elements,
     }
+    if is_robotwin:
+        relative_mse = relative_mse_sum / total_elements
+        absolute_mse = absolute_mse_sum / total_elements
+        metrics.update(
+            {
+                "relative_mse": relative_mse,
+                "relative_rmse": relative_mse**0.5,
+                "relative_mae": relative_mae_sum / total_elements,
+                "absolute_mse": absolute_mse,
+                "absolute_rmse": absolute_mse**0.5,
+                "absolute_mae": absolute_mae_sum / total_elements,
+            }
+        )
+    else:
+        raw_mse = raw_mse_sum / total_elements
+        metrics.update(
+            {
+                "raw_mse": raw_mse,
+                "raw_rmse": raw_mse**0.5,
+                "raw_mae": raw_mae_sum / total_elements,
+            }
+        )
+    return metrics
 
 
 def compare(args: argparse.Namespace) -> dict[str, Any]:
@@ -206,20 +245,35 @@ def compare(args: argparse.Namespace) -> dict[str, Any]:
 
     mlp_mse = float(mlp["mse"])
     rdt_mse = float(rdt["mse"])
-    mlp_relative_mse = float(mlp["relative_mse"])
-    rdt_relative_mse = float(rdt["relative_mse"])
-    mlp_absolute_mse = float(mlp["absolute_mse"])
-    rdt_absolute_mse = float(rdt["absolute_mse"])
-    return {
+    result = {
         "mlp": mlp,
         "rdt": rdt,
         "delta_mse": rdt_mse - mlp_mse,
         "ratio_mse": rdt_mse / mlp_mse if mlp_mse != 0 else None,
-        "relative_delta_mse": rdt_relative_mse - mlp_relative_mse,
-        "relative_ratio_mse": rdt_relative_mse / mlp_relative_mse if mlp_relative_mse != 0 else None,
-        "absolute_delta_mse": rdt_absolute_mse - mlp_absolute_mse,
-        "absolute_ratio_mse": rdt_absolute_mse / mlp_absolute_mse if mlp_absolute_mse != 0 else None,
     }
+    if "relative_mse" in mlp and "relative_mse" in rdt:
+        mlp_relative_mse = float(mlp["relative_mse"])
+        rdt_relative_mse = float(rdt["relative_mse"])
+        mlp_absolute_mse = float(mlp["absolute_mse"])
+        rdt_absolute_mse = float(rdt["absolute_mse"])
+        result.update(
+            {
+                "relative_delta_mse": rdt_relative_mse - mlp_relative_mse,
+                "relative_ratio_mse": rdt_relative_mse / mlp_relative_mse if mlp_relative_mse != 0 else None,
+                "absolute_delta_mse": rdt_absolute_mse - mlp_absolute_mse,
+                "absolute_ratio_mse": rdt_absolute_mse / mlp_absolute_mse if mlp_absolute_mse != 0 else None,
+            }
+        )
+    if "raw_mse" in mlp and "raw_mse" in rdt:
+        mlp_raw_mse = float(mlp["raw_mse"])
+        rdt_raw_mse = float(rdt["raw_mse"])
+        result.update(
+            {
+                "raw_delta_mse": rdt_raw_mse - mlp_raw_mse,
+                "raw_ratio_mse": rdt_raw_mse / mlp_raw_mse if mlp_raw_mse != 0 else None,
+            }
+        )
+    return result
 
 
 def main() -> None:

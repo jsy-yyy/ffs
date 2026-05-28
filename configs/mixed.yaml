@@ -8,6 +8,7 @@ backbone:
   optimize_build_volume: pytorch1
 
 dataset:
+  type: robotwin-stereo-lerobot
   roots:
     - /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
     - /data/jsy/Fast-FoundationStereo/lerobot_dataset_randomized

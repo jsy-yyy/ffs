@@ -8,25 +8,24 @@ backbone:
   optimize_build_volume: pytorch1
 
 dataset:
-  type: robotwin-stereo-lerobot
-  root: /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
-  image_size: [256, 320]
+  type: robomimic-stereo-lerobot
+  root: /data/jsy/robomimic/robomimic_lerobot_square
+  image_size: [224, 224]
+  num_episodes: 100
   camera_pairs:
-    - [observation.images.head_camera_left, observation.images.head_camera_right]
-    - [observation.images.front_camera_left, observation.images.front_camera_right]
-    # - [observation.images.left_camera_left, observation.images.left_camera_right]
-    # - [observation.images.right_camera_left, observation.images.right_camera_right]
+    - [observation.images.agentview_left, observation.images.agentview_right]
+    - [observation.images.robot0_eye_in_hand_left, observation.images.robot0_eye_in_hand_right]
   action_normalization:
     method: quantile
-    normalize_indices: [0, 1, 2, 8, 9, 10]
+    normalize_indices: [0, 1, 2, 3, 4, 5, 6]
     stats:
-      q01: [-0.03120909258723259, -0.06520890444517136, -0.0009331027395091951, 0.957804262638092, -0.04635748639702797, -0.005277806427329779, -0.043041497468948364, 0.0, -0.03639077767729759, -0.0006847904878668487, -0.0012572933919727802, 0.9542942047119141, -0.0005909204483032227, -0.006055351346731186, -0.059804659336805344, 0.0]
-      q99: [0.08293195068836212, 0.00038992761983536184, 0.06834829598665237, 1.0, 0.001792803406715393, 0.2803484797477722, 0.060310665518045425, 1.0, 0.10343658179044724, 0.0697120949625969, 0.08555547147989273, 1.0, 0.04566377401351929, 0.2953159213066101, 0.03881560266017914, 1.0]
+      q01: [-0.5420234875193051, -0.49978102449809264, -0.7431031955698542, -0.07038834379857999, -0.10083929680221491, -0.25879100838619457, -1.0]
+      q99: [0.9970069651864254, 0.7671304940362492, 0.9481036908195938, 0.07606787359307764, 0.15165477592950483, 0.27189579713040773, 0.9999922927457302]
 
 policy:
   num_history_frames: 2
   action_horizon: 8
-  action_dim: 16
+  action_dim: 7
   state_dim: 16
   use_disparity: true
   disparity_ablation: none
@@ -52,23 +51,24 @@ head:
     use_flash_attn: true
     num_register_tokens: 4
     num_inference_steps: 10
-    sample_init: zeros
+    sample_init: randn
     act_adaptor: mlp3x_silu
     state_adaptor: mlp3x_silu
     img_adaptor: linear
     dtype: float32
 
 train:
-  output_dir: outputs/rdt_v1
-  epochs: 100
-  batch_size: 2
+  output_dir: outputs/robomimic_square_rdt
+  epochs: 500
+  batch_size: 4
   num_workers: 4
-  lr: 3e-4
+  lr: 1e-4
   weight_decay: 0.1
   amp: true
+  suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 3000
-  resume_from: 
+  resume_from: outputs/robomimic_square_rdt/step_9000.pt
 
 visualization:
   query_attention:

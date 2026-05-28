@@ -25,7 +25,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ffs import load_config
-from ffs.datasets import LeRobotStereoDataset, MultiLeRobotStereoDataset
+from ffs.datasets import build_stereo_lerobot_dataset
 from ffs.policies.stereo_action_policy import build_policy
 
 
@@ -146,18 +146,7 @@ def make_loader(cfg: dict[str, Any], rank: int, world_size: int) -> tuple[DataLo
     policy_cfg = cfg["policy"]
     dataset_cfg = cfg["dataset"]
     train_cfg = cfg["train"]
-    dataset_kwargs = {
-        "camera_pairs": dataset_cfg["camera_pairs"],
-        "num_history_frames": policy_cfg["num_history_frames"],
-        "action_horizon": policy_cfg["action_horizon"],
-        "image_size": dataset_cfg.get("image_size"),
-        "episode_indices": dataset_cfg.get("episode_indices"),
-        "action_normalization": dataset_cfg.get("action_normalization"),
-    }
-    if dataset_cfg.get("roots") is not None:
-        dataset = MultiLeRobotStereoDataset(roots=dataset_cfg["roots"], **dataset_kwargs)
-    else:
-        dataset = LeRobotStereoDataset(root=dataset_cfg["root"], **dataset_kwargs)
+    dataset = build_stereo_lerobot_dataset(dataset_cfg, policy_cfg)
     if int(policy_cfg["state_dim"]) != dataset.state_dim:
         raise ValueError(
             f"policy.state_dim={policy_cfg['state_dim']} does not match dataset state_dim={dataset.state_dim}"

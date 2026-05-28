@@ -18,8 +18,14 @@ action: [B, action_horizon, action_dim]
 ```
 
 `T`, `V`, `state_dim`, `action_horizon`, and `action_dim` are set by
-`configs/default.yaml`. The current dataset stores both `observation.state`
-and the raw parquet `action` as 16D dual-arm EEF poses:
+`configs/default.yaml`. `dataset.type` is required and selects the LeRobot
+stereo loader:
+
+- `robotwin-stereo-lerobot`: RoboTwin data with video-backed stereo frames.
+- `robomimic-stereo-lerobot`: robomimic data with image bytes stored in parquet.
+
+The RoboTwin dataset stores both `observation.state` and the raw parquet
+`action` as 16D dual-arm EEF poses:
 
 ```text
 left:  x y z qw qx qy qz gripper
@@ -35,6 +41,7 @@ window: positions are expressed in that EEF frame, quaternions are
 
 ```yaml
 dataset:
+  type: robotwin-stereo-lerobot
   root: /data/jsy/Fast-FoundationStereo/lerobot_dataset
   image_size: [256, 320]
   camera_pairs:
@@ -42,7 +49,7 @@ dataset:
     - [observation.images.right_camera_left, observation.images.right_camera_right]
 ```
 
-The LeRobot parquet files provide `observation.state`, `action`, and frame
+The RoboTwin parquet files provide `observation.state`, `action`, and frame
 indices. The loader expects the new dataset format where `action` has the same
 shape and feature names as `observation.state`. RGB frames are read from:
 
@@ -53,6 +60,19 @@ videos/{video_key}/chunk-*/file-*.mp4
 The dataset videos are AV1 encoded, so the loader uses `imageio` with the
 system `ffmpeg` executable. Frames are resized to `dataset.image_size` before
 being passed to FoundationStereo.
+
+The robomimic loader directly trains the 7D robomimic delta action and does
+not run EEF relative/absolute conversion. Use `configs/robomimic_square.yaml`
+for the square dataset:
+
+```yaml
+dataset:
+  type: robomimic-stereo-lerobot
+  root: /data/jsy/robomimic/robomimic_lerobot_square
+  camera_pairs:
+    - [observation.images.agentview_left, observation.images.agentview_right]
+    - [observation.images.robot0_eye_in_hand_left, observation.images.robot0_eye_in_hand_right]
+```
 
 ## Action heads
 
@@ -116,14 +136,14 @@ should match the number of GPUs you want to use:
 
 ```bash
 cd /data/jsy/ffs
-torchrun --standalone --nproc_per_node=2 scripts/train.py --config configs/default.yaml
+python -m torch.distributed.run --standalone --nproc_per_node=2 scripts/train.py --config configs/default.yaml
 ```
 
 To choose specific GPUs, set `CUDA_VISIBLE_DEVICES` before `torchrun`:
 
 ```bash
 cd /data/jsy/ffs
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 scripts/train.py --config configs/default.yaml
+CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.run --standalone --nproc_per_node=2 scripts/train.py --config configs/default.yaml
 ```
 
 Notes for DDP training:

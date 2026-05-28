@@ -8,6 +8,7 @@ backbone:
   optimize_build_volume: pytorch1
 
 dataset:
+  type: robotwin-stereo-lerobot
   root: /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
   episode_indices: [0]
   image_size: [256, 320]
