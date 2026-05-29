@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ffs.argparse_compat import add_boolean_optional_argument
 from ffs import load_config_for_checkpoint
 from ffs.datasets.lerobot import relative_action_to_absolute_eef_pose
 from scripts.eval_offline import autocast_context, load_model, make_loader
@@ -291,8 +292,8 @@ def main() -> None:
     parser.add_argument("--log-interval", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--rdt-sample-init", choices=["randn", "zeros"], default=None)
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--suppress-dynamo-errors", action=argparse.BooleanOptionalAction, default=True)
+    add_boolean_optional_argument(parser, "--amp", default=True)
+    add_boolean_optional_argument(parser, "--suppress-dynamo-errors", default=True)
     args = parser.parse_args()
 
     metrics = compare(args)

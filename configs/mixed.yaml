@@ -63,10 +63,14 @@ head:
 train:
   output_dir: outputs/rdt_v1_mixed_zeros_init
   epochs: 50
+  epoch_every_n_steps:
   batch_size: 2
   num_workers: 4
   lr: 3e-5
-  weight_decay: 0.1
+  weight_decay: 1.0e-6
+  scheduler_type: cosine
+  warmup_steps: 500
+  num_cycles: 0.5
   amp: true
   suppress_dynamo_errors: true
   log_interval: 50

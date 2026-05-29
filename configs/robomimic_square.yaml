@@ -9,7 +9,7 @@ backbone:
 
 dataset:
   type: robomimic-stereo-lerobot
-  root: /data/jsy/robomimic/robomimic_lerobot_square
+  root: /data/jsy/robomimic/robomimic_lerobot_square_dataset
   image_size: [224, 224]
   num_episodes: 100
   camera_pairs:
@@ -26,7 +26,7 @@ policy:
   num_history_frames: 2
   action_horizon: 8
   action_dim: 7
-  state_dim: 16
+  state_dim: 23
   use_disparity: true
   disparity_ablation: none
 
@@ -58,17 +58,21 @@ head:
     dtype: float32
 
 train:
-  output_dir: outputs/robomimic_square_rdt
+  output_dir: outputs/robomimic_square_rdt_aligned
   epochs: 500
+  epoch_every_n_steps: 400
   batch_size: 4
   num_workers: 4
   lr: 1e-4
-  weight_decay: 0.1
+  weight_decay: 1.0e-6
+  scheduler_type: cosine
+  warmup_steps: 500
+  num_cycles: 0.5
   amp: true
   suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 3000
-  resume_from: outputs/robomimic_square_rdt/step_9000.pt
+  resume_from: 
 
 visualization:
   query_attention:

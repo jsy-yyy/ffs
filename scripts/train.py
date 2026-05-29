@@ -4,6 +4,7 @@ import argparse
 import copy
 import importlib
 import json
+import math
 import os
 import sys
 import warnings
@@ -67,10 +68,33 @@ def autocast_context(device: torch.device, use_amp: bool) -> Any:
     return torch.amp.autocast(device_type=device.type, enabled=use_amp)
 
 
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    train_cfg: dict[str, Any],
+    effective_epoch_steps: int,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    scheduler_type = train_cfg["scheduler_type"]
+    if scheduler_type != "cosine":
+        raise ValueError(f"Unsupported scheduler_type={scheduler_type!r}; expected 'cosine'.")
+
+    warmup_steps = int(train_cfg.get("warmup_steps", 0))
+    num_cycles = float(train_cfg.get("num_cycles", 0.5))
+    num_training_steps = int(effective_epoch_steps) * int(train_cfg["epochs"])
+
+    def lr_lambda(current_step: int) -> float:
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: Any,
     epoch: int,
     step: int,
@@ -83,6 +107,7 @@ def save_checkpoint(
         {
             "model": raw_model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "epoch": epoch,
             "step": step,
@@ -104,6 +129,7 @@ def load_checkpoint(
     path: str | Path,
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: Any,
     device: torch.device,
     is_main: bool = True,
@@ -112,6 +138,7 @@ def load_checkpoint(
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     raw_model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
     if ckpt.get("scaler"):
         scaler.load_state_dict(ckpt["scaler"])
     epoch = int(ckpt.get("epoch", 0))
@@ -197,15 +224,19 @@ def train(args: argparse.Namespace) -> None:
     use_amp = bool(train_cfg.get("amp", True)) and device.type == "cuda"
     scaler = make_grad_scaler(use_amp)
 
+    epoch_every_n_steps = train_cfg.get("epoch_every_n_steps")
+    effective_epoch_steps = min(int(epoch_every_n_steps), len(loader)) if epoch_every_n_steps else len(loader)
+    scheduler = make_lr_scheduler(optimizer, train_cfg, effective_epoch_steps)
+
     start_epoch = 0
     start_step = 0
     global_step = 0
     resume_from = args.resume_from or train_cfg.get("resume_from")
     if resume_from:
         start_epoch, start_step, global_step = load_checkpoint(
-            resume_from, model, optimizer, scaler, device, is_main=is_main
+            resume_from, model, optimizer, scheduler, scaler, device, is_main=is_main
         )
-        if start_step >= len(loader):
+        if start_step >= effective_epoch_steps:
             start_epoch += 1
             start_step = 0
     elif is_main:
@@ -233,6 +264,8 @@ def train(args: argparse.Namespace) -> None:
         skip_steps = start_step if epoch == start_epoch else 0
 
         for step, batch in enumerate(loader):
+            if step >= effective_epoch_steps:
+                break
             if step < skip_steps:
                 continue
             last_step = step
@@ -248,6 +281,7 @@ def train(args: argparse.Namespace) -> None:
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
 
             global_step += 1
             loss_value = float(loss.detach().cpu())
@@ -271,9 +305,9 @@ def train(args: argparse.Namespace) -> None:
                     )
 
             if is_main and save_ckpt_interval > 0 and global_step % save_ckpt_interval == 0:
-                save_checkpoint(output_dir / "latest.pt", model, optimizer, scaler,
+                save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, scaler,
                                 epoch, step, step + 1, global_step, cfg)
-                save_checkpoint(output_dir / f"step_{global_step}.pt", model, optimizer, scaler,
+                save_checkpoint(output_dir / f"step_{global_step}.pt", model, optimizer, scheduler, scaler,
                                 epoch, step, step + 1, global_step, cfg)
 
             if stop_step is not None and global_step >= stop_step:
@@ -287,10 +321,10 @@ def train(args: argparse.Namespace) -> None:
         final_epoch = last_epoch if done else last_epoch + 1
         final_step = last_step if done else -1
         final_next_step = last_step + 1 if done else 0
-        save_checkpoint(output_dir / "latest.pt", model, optimizer, scaler,
+        save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, scaler,
                         final_epoch, final_step, final_next_step, global_step, cfg)
 
-    del model, optimizer, scaler
+    del model, optimizer, scheduler, scaler
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     cleanup_dist()

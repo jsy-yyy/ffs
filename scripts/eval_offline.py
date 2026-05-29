@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from ffs.argparse_compat import add_boolean_optional_argument
 from ffs import load_config_for_checkpoint
 from ffs.datasets import build_stereo_lerobot_dataset
 from ffs.datasets.lerobot import relative_action_to_absolute_eef_pose
@@ -280,8 +281,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--sample-init", choices=["randn", "zeros"], default=None)
     parser.add_argument("--disparity-ablation", choices=["none", "zero", "shuffle"], default="none")
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--suppress-dynamo-errors", action=argparse.BooleanOptionalAction, default=True)
+    add_boolean_optional_argument(parser, "--amp", default=True)
+    add_boolean_optional_argument(parser, "--suppress-dynamo-errors", default=True)
     parser.add_argument("--visualize-query-attention", action="store_true")
     parser.add_argument("--query-attention-output-dir", default=None)
     parser.add_argument("--query-attention-mode", choices=["all", "single"], default=None)

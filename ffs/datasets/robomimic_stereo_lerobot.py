@@ -112,11 +112,11 @@ class RobomimicStereoLeRobotDataset(Dataset):
             groups.setdefault((row["data_file"], row["episode_index"]), []).append(idx)
 
         for indices in groups.values():
-            for offset in range(0, len(indices) - self.action_horizon + 1):
+            for offset in range(len(indices)):
                 history_start = offset - self.num_history_frames + 1
                 pad_count = max(0, -history_start)
                 history_offsets = [0] * pad_count + list(range(max(0, history_start), offset + 1))
-                future_offsets = range(offset, offset + self.action_horizon)
+                future_offsets = [min(i, len(indices) - 1) for i in range(offset, offset + self.action_horizon)]
                 samples.append(
                     (
                         tuple(indices[i] for i in history_offsets),

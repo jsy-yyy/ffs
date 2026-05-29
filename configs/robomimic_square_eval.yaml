@@ -1,0 +1,41 @@
+save_root: outputs/robomimic_square_eval_aligned
+dry_run: false
+
+policy:
+  host: 127.0.0.1
+  port: 29068
+  ffs_root: /data/jsy/ffs
+  checkpoint: outputs/robomimic_square_rdt_aligned/latest.pt
+  config_path:
+  device: cuda:0
+  amp: true
+  sample_init: zeros
+  disparity_ablation: none
+  debug_actions: false
+
+env:
+  dataset_path: /data/jsy/robomimic/datasets/square/ph/stereo_image_v15.hdf5
+  reset_mode: dataset
+  n_rollouts: 20
+  horizon: 400
+  seed: 0
+  demo_offset: 0
+  camera_height: 224
+  camera_width: 224
+  stereo_baseline: 0.06
+  # Current host needs NUMBA_DISABLE_JIT=1 for robosuite import.
+  numba_disable_jit: true
+  # Override to osmesa only if that backend is installed and working.
+  mujoco_gl: egl
+  render_gpu_device_id:
+
+action:
+  # null executes the whole predicted action horizon; set 1 for strict receding-horizon.
+  execute_chunk_steps:
+
+record:
+  save_metrics: true
+  save_episode_jsonl: true
+  save_video: false
+  video_skip: 5
+  save_action_jsonl: true

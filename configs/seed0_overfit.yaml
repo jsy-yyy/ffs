@@ -51,10 +51,14 @@ head:
 train:
   output_dir: outputs/mlp_query_overfit500_new
   epochs: 500
+  epoch_every_n_steps:
   batch_size: 2
   num_workers: 0
   lr: 3.0e-5
-  weight_decay: 0.1
+  weight_decay: 1.0e-6
+  scheduler_type: cosine
+  warmup_steps: 500
+  num_cycles: 0.5
   amp: true
   suppress_dynamo_errors: true
   log_interval: 50
