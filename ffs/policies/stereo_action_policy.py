@@ -5,6 +5,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ffs.backbones import FoundationStereoBackbone
 from ffs.heads import ActionHead, build_action_head
@@ -102,6 +103,54 @@ class StateConditionedSpatialResampler(nn.Module):
         return self.out_norm(tokens)
 
 
+class DisparityFusionEncoder(nn.Module):
+    """Encode dense disparity into local geometry features for multi-scale fusion."""
+
+    def __init__(
+        self,
+        max_disp: int = 192,
+        input_mode: str = "disp_xy",
+        hidden_channels: int = 16,
+        output_channels: int = 16,
+        num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        if max_disp <= 0:
+            raise ValueError("max_disp must be positive.")
+        if input_mode not in {"disp", "disp_xy"}:
+            raise ValueError("disparity fusion input_mode must be one of: disp, disp_xy.")
+        if hidden_channels <= 0:
+            raise ValueError("disparity fusion hidden_channels must be positive.")
+        if output_channels <= 0:
+            raise ValueError("disparity fusion output_channels must be positive.")
+        if num_layers <= 0:
+            raise ValueError("disparity fusion num_layers must be positive.")
+
+        self.max_disp = float(max_disp)
+        self.input_mode = input_mode
+        self.output_channels = output_channels
+
+        in_channels = 1 if input_mode == "disp" else 3
+        layers: list[nn.Module] = []
+        for layer_idx in range(num_layers):
+            out_channels = output_channels if layer_idx == num_layers - 1 else hidden_channels
+            layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            layers.append(nn.SiLU())
+            in_channels = out_channels
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, disp: torch.Tensor) -> torch.Tensor:
+        disp = (disp.float() / self.max_disp).clamp(0.0, 1.0)
+        if self.input_mode == "disp_xy":
+            _, _, height, width = disp.shape
+            y = torch.linspace(0.0, 1.0, height, device=disp.device, dtype=disp.dtype)
+            x = torch.linspace(0.0, 1.0, width, device=disp.device, dtype=disp.dtype)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            xy = torch.stack([xx, yy], dim=0).unsqueeze(0).expand(disp.shape[0], -1, -1, -1)
+            disp = torch.cat([disp, xy], dim=1)
+        return self.net(disp)
+
+
 class StereoActionPolicy(nn.Module):
     """FoundationStereo visual history + proprioceptive history -> actions."""
 
@@ -119,6 +168,9 @@ class StereoActionPolicy(nn.Module):
         feature_queries_per_scale: int = 4,
         disp_queries: int = 8,
         spatial_query_num_heads: int = 8,
+        disparity_fusion_cfg: dict[str, Any] | None = None,
+        use_disparity_tokens: bool = True,
+        max_disp: int = 192,
         head_hidden_dim: int | None = None,
         head_layers: int | None = None,
         head_dropout: float | None = None,
@@ -137,7 +189,14 @@ class StereoActionPolicy(nn.Module):
         self.condition_token_dim = condition_token_dim
         self.feature_queries_per_scale = feature_queries_per_scale
         self.disp_queries = disp_queries
+        self.max_disp = max_disp
         self.feature_names = tuple(backbone.feature_names)
+        fusion_cfg = dict(disparity_fusion_cfg or {})
+        self.disparity_fusion_enabled = bool(fusion_cfg.get("enabled", False))
+        if self.disparity_fusion_enabled and not use_disparity:
+            raise ValueError("disparity_fusion requires use_disparity=True.")
+        self.use_disparity_tokens = bool(use_disparity and use_disparity_tokens)
+        self.use_disparity = bool(use_disparity and (self.use_disparity_tokens or self.disparity_fusion_enabled))
 
         if condition_token_dim <= 0:
             raise ValueError("condition_token_dim must be positive.")
@@ -155,10 +214,32 @@ class StereoActionPolicy(nn.Module):
         if missing_channels:
             raise ValueError(f"Backbone is missing feature channels for: {', '.join(missing_channels)}")
 
+        self.disparity_fusion_feature_names: tuple[str, ...] = ()
+        self.disparity_fusion_encoder: DisparityFusionEncoder | None = None
+        disparity_fusion_channels = 0
+        if self.disparity_fusion_enabled:
+            configured_names = fusion_cfg.get("feature_names", self.feature_names)
+            self.disparity_fusion_feature_names = tuple(configured_names)
+            unknown_fusion_names = sorted(set(self.disparity_fusion_feature_names) - set(self.feature_names))
+            if unknown_fusion_names:
+                raise ValueError(
+                    "disparity_fusion.feature_names must be selected backbone feature names; "
+                    f"unknown: {', '.join(unknown_fusion_names)}"
+                )
+            self.disparity_fusion_encoder = DisparityFusionEncoder(
+                max_disp=max_disp,
+                input_mode=fusion_cfg.get("input_mode", "disp_xy"),
+                hidden_channels=int(fusion_cfg.get("hidden_channels", 16)),
+                output_channels=int(fusion_cfg.get("output_channels", 16)),
+                num_layers=int(fusion_cfg.get("num_layers", 2)),
+            )
+            disparity_fusion_channels = self.disparity_fusion_encoder.output_channels
+
         self.feature_resamplers = nn.ModuleDict(
             {
                 name: StateConditionedSpatialResampler(
-                    in_channels=int(feature_channels[name]),
+                    in_channels=int(feature_channels[name])
+                    + (disparity_fusion_channels if name in self.disparity_fusion_feature_names else 0),
                     state_dim=state_dim,
                     token_dim=condition_token_dim,
                     num_queries=feature_queries_per_scale,
@@ -169,7 +250,7 @@ class StereoActionPolicy(nn.Module):
         )
         self.state_proj = nn.Linear(state_dim, condition_token_dim)
 
-        if use_disparity:
+        if self.use_disparity_tokens:
             self.disp_resampler = StateConditionedSpatialResampler(
                 in_channels=1,
                 state_dim=state_dim,
@@ -181,7 +262,7 @@ class StereoActionPolicy(nn.Module):
             self.disp_resampler = None
 
         visual_tokens_per_pair = len(self.feature_names) * feature_queries_per_scale
-        if use_disparity:
+        if self.use_disparity_tokens:
             visual_tokens_per_pair += disp_queries
         tokens_per_frame = num_stereo_pairs * visual_tokens_per_pair + 1
         condition_len = num_history_frames * tokens_per_frame
@@ -255,6 +336,31 @@ class StereoActionPolicy(nn.Module):
             return disp.flatten(2).index_select(2, perm).view_as(disp)
         raise ValueError(f"Unsupported disparity_ablation: {self.disparity_ablation}")
 
+    def _fuse_disparity_features(
+        self,
+        backbone_out: dict[str, torch.Tensor],
+        disp: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        if not self.disparity_fusion_enabled:
+            return backbone_out
+        if disp is None:
+            raise ValueError("Backbone did not return disparity needed for disparity_fusion.")
+        if self.disparity_fusion_encoder is None:
+            raise RuntimeError("disparity_fusion is enabled but encoder was not initialized.")
+
+        disp_features = self.disparity_fusion_encoder(disp)
+        fused = dict(backbone_out)
+        for name in self.disparity_fusion_feature_names:
+            feature = fused[name]
+            resized = F.interpolate(
+                disp_features,
+                size=feature.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).to(dtype=feature.dtype)
+            fused[name] = torch.cat([feature, resized], dim=1)
+        return fused
+
     def encode_tokens(
         self,
         left: torch.Tensor,
@@ -270,6 +376,11 @@ class StereoActionPolicy(nn.Module):
         state_by_pair = state_by_pair.reshape(b * t * v, self.state_dim)
 
         backbone_out = self.backbone(left, right)
+        disp = None
+        if self.use_disparity:
+            disp = self._ablate_disparity(backbone_out["disp"]).float()
+            backbone_out = self._fuse_disparity_features(backbone_out, disp)
+
         attention_maps = {}
         visual_out = self._resample_visual_tokens(
             backbone_out,
@@ -299,9 +410,10 @@ class StereoActionPolicy(nn.Module):
         ).flatten(2, 3)
         frame_parts = [visual_tokens]
 
-        if self.use_disparity:
+        if self.use_disparity_tokens:
             # disp: [B*T*V, 1, H, W] -> query tokens: [B, T, V*disp_queries, C]
-            disp = self._ablate_disparity(backbone_out["disp"]).float()
+            if disp is None:
+                raise ValueError("Backbone did not return disparity needed for disparity tokens.")
             disp_out = self.disp_resampler(
                 disp,
                 state_by_pair,
@@ -369,6 +481,8 @@ def resolve_action_head_cfg(head_cfg: dict[str, Any]) -> dict[str, Any]:
         "feature_queries_per_scale",
         "disp_queries",
         "spatial_query_num_heads",
+        "disparity_fusion",
+        "use_disparity_tokens",
         "mlp",
         "rdt",
     }
@@ -382,6 +496,13 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
     dataset_cfg = cfg.get("dataset", {})
     action_head_cfg = resolve_action_head_cfg(head_cfg)
     num_stereo_pairs = len(dataset_cfg.get("camera_pairs", []))
+    policy_use_disparity = bool(policy_cfg.get("use_disparity", True))
+    disparity_fusion_cfg = head_cfg.get("disparity_fusion")
+    disparity_fusion_enabled = bool(
+        isinstance(disparity_fusion_cfg, dict) and disparity_fusion_cfg.get("enabled", False)
+    )
+    use_disparity_tokens = bool(head_cfg.get("use_disparity_tokens", True))
+    backbone_use_disparity = policy_use_disparity and (use_disparity_tokens or disparity_fusion_enabled)
 
     backbone = FoundationStereoBackbone(
         foundation_root=backbone_cfg["foundation_root"],
@@ -389,7 +510,7 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
         valid_iters=backbone_cfg.get("valid_iters", 4),
         max_disp=backbone_cfg.get("max_disp", 192),
         freeze=backbone_cfg.get("freeze", True),
-        use_disparity=policy_cfg.get("use_disparity", True),
+        use_disparity=backbone_use_disparity,
         optimize_build_volume=backbone_cfg.get("optimize_build_volume", "pytorch1"),
         feature_names=backbone_cfg["feature_names"],
     )
@@ -401,11 +522,14 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
         action_dim=policy_cfg["action_dim"],
         action_horizon=policy_cfg["action_horizon"],
         num_stereo_pairs=num_stereo_pairs,
-        use_disparity=policy_cfg.get("use_disparity", True),
+        use_disparity=backbone_use_disparity,
         disparity_ablation=policy_cfg.get("disparity_ablation", "none"),
         condition_token_dim=head_cfg["condition_token_dim"],
         feature_queries_per_scale=head_cfg.get("feature_queries_per_scale", 4),
         disp_queries=head_cfg.get("disp_queries", 8),
         spatial_query_num_heads=head_cfg.get("spatial_query_num_heads", 8),
+        disparity_fusion_cfg=disparity_fusion_cfg,
+        use_disparity_tokens=use_disparity_tokens,
+        max_disp=backbone_cfg.get("max_disp", 192),
         action_head_cfg=action_head_cfg,
     )

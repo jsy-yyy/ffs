@@ -407,6 +407,7 @@ class RDTActionHead(ActionHead):
         num_register_tokens: int = 4,
         num_inference_steps: int = 10,
         sample_init: Literal["randn", "zeros"] = "randn",
+        clip_sample: bool = False,
         act_adaptor: str = "mlp3x_silu",
         state_adaptor: str = "mlp3x_silu",
         img_adaptor: str = "linear",
@@ -434,6 +435,7 @@ class RDTActionHead(ActionHead):
         self.num_register_tokens = num_register_tokens
         self.num_inference_steps = num_inference_steps
         self.sample_init = sample_init
+        self.clip_sample = bool(clip_sample)
         self.param_dtype = _as_dtype(dtype)
 
         if tokens_per_frame is None and num_history_frames is not None:
@@ -622,6 +624,8 @@ class RDTActionHead(ActionHead):
                 img_mask=img_mask,
             )
             noisy_action = noisy_action + pred * step_size
+            if self.clip_sample:
+                noisy_action = noisy_action.clamp(-1.0, 1.0)
             timestep = timestep + step_size
 
         return noisy_action.to(frame_tokens.dtype)

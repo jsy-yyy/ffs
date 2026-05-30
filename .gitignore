@@ -49,3 +49,6 @@ Thumbs.db
 
 examples/
 tests/
+*vis_*
+tmp
+vis*

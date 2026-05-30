@@ -24,7 +24,7 @@ dataset:
 
 policy:
   num_history_frames: 2
-  action_horizon: 8
+  action_horizon: 16
   action_dim: 7
   state_dim: 23
   use_disparity: true
@@ -34,8 +34,16 @@ head:
   type: rdt
   condition_token_dim: 256
   feature_queries_per_scale: 2
-  disp_queries: 4
+  disp_queries: 2
   spatial_query_num_heads: 8
+  use_disparity_tokens: true
+  disparity_fusion:
+    enabled: true
+    feature_names: [feat_04, feat_32]
+    input_mode: disp_xy
+    hidden_channels: 16
+    output_channels: 16
+    num_layers: 2
   mlp:
     hidden_dim: 512
     num_blocks: 10
@@ -52,16 +60,17 @@ head:
     num_register_tokens: 4
     num_inference_steps: 10
     sample_init: randn
+    clip_sample: true
     act_adaptor: mlp3x_silu
     state_adaptor: mlp3x_silu
     img_adaptor: linear
     dtype: float32
 
 train:
-  output_dir: outputs/robomimic_square_rdt_aligned
+  output_dir: outputs/robomimic_square_rdt_disp_fusion
   epochs: 500
-  epoch_every_n_steps: 400
-  batch_size: 4
+  epoch_every_n_steps: 100
+  batch_size: 8
   num_workers: 4
   lr: 1e-4
   weight_decay: 1.0e-6
@@ -71,7 +80,7 @@ train:
   amp: true
   suppress_dynamo_errors: true
   log_interval: 50
-  save_ckpt_interval: 3000
+  save_ckpt_interval: 5000
   resume_from: 
 
 visualization:

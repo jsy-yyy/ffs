@@ -17,6 +17,7 @@ class PolicyConfig:
     device: str = "cuda:0"
     amp: bool = True
     sample_init: str | None = "zeros"
+    clip_sample: bool | None = None
     disparity_ablation: str = "none"
     debug_actions: bool = False
 
@@ -24,11 +25,9 @@ class PolicyConfig:
 @dataclass
 class EnvConfig:
     dataset_path: str = "/data/jsy/robomimic/datasets/square/ph/stereo_image_v15.hdf5"
-    reset_mode: str = "dataset"
-    n_rollouts: int = 20
+    n_rollouts: int = 50
     horizon: int = 400
     seed: int = 0
-    demo_offset: int = 0
     camera_height: int | None = 224
     camera_width: int | None = 224
     stereo_baseline: float | None = 0.06
@@ -121,4 +120,3 @@ __all__ = [
     "load_ffs_sidecar_config",
     "resolve_ffs_config_path",
 ]
-

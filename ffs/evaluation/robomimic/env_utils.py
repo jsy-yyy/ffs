@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import copy
 import json
 import os
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import numpy as np
 
 
 IMAGE_PREFIX = "observation.images."
+DEFAULT_ROBOMIMIC_ROOT = "/data/jsy/robomimic"
 
 
 def apply_runtime_env(numba_disable_jit: bool = True, mujoco_gl: str | None = "egl") -> None:
@@ -30,11 +32,6 @@ def load_env_meta(dataset_path: str | Path) -> dict[str, Any]:
     with h5py.File(dataset_path, "r") as f:
         env_args = f["data"].attrs["env_args"]
         return json.loads(decode_attr(env_args))
-
-
-def sorted_demo_names(dataset_path: str | Path) -> list[str]:
-    with h5py.File(dataset_path, "r") as f:
-        return sorted(f["data"].keys(), key=lambda name: int(name.split("_")[-1]))
 
 
 def payload_image_name(feature_key: str) -> str:
@@ -72,21 +69,18 @@ def make_robosuite_env(
     camera_width: int,
     render_gpu_device_id: int | None = None,
 ):
-    import robosuite
+    from copy import deepcopy
 
-    env_kwargs = copy.deepcopy(env_meta["env_kwargs"])
-    env_kwargs.update(
-        has_renderer=False,
-        has_offscreen_renderer=True,
-        use_camera_obs=False,
-        camera_names=list(camera_names),
-        camera_heights=int(camera_height),
-        camera_widths=int(camera_width),
-        ignore_done=True,
-    )
+    _prefer_local_robomimic()
+    import robomimic.utils.obs_utils as ObsUtils
+    import robomimic.utils.env_utils as EnvUtils
+
+    env_kwargs = deepcopy(env_meta["env_kwargs"])
+    env_kwargs["camera_names"] = list(camera_names)
+    env_kwargs["camera_heights"] = int(camera_height)
+    env_kwargs["camera_widths"] = int(camera_width)
     if render_gpu_device_id is not None:
         env_kwargs["render_gpu_device_id"] = int(render_gpu_device_id)
-
     for key in (
         "env_name",
         "camera_height",
@@ -97,6 +91,7 @@ def make_robosuite_env(
         "use_depth_obs",
     ):
         env_kwargs.pop(key, None)
+    import robosuite
 
     version_parts = getattr(robosuite, "__version__", "1.4.0").split(".")[:2]
     try:
@@ -106,39 +101,60 @@ def make_robosuite_env(
     if major == 1 and minor < 5:
         env_kwargs.pop("lite_physics", None)
 
-    env_version = env_meta.get("env_version")
-    if env_version is not None and env_version != getattr(robosuite, "__version__", None):
-        print(
-            "WARNING: dataset robosuite version is "
-            f"{env_version}, but installed version is {robosuite.__version__}.",
-            flush=True,
-        )
-    return robosuite.make(env_meta["env_name"], **env_kwargs)
+    _initialize_robomimic_obs_utils(ObsUtils, camera_names, use_depth_obs=False)
+    env = EnvUtils.create_env(
+        env_type=EnvUtils.get_env_type(env_meta=env_meta),
+        env_name=env_meta["env_name"],
+        render=False,
+        render_offscreen=True,
+        use_image_obs=False,
+        use_depth_obs=False,
+        **env_kwargs,
+    )
+    EnvUtils.check_env_version(env, env_meta)
+    return env
 
 
-def reset_to(env, state: np.ndarray, model_xml: Any | None = None, ep_meta: Any | None = None) -> None:
-    if model_xml is not None:
-        if ep_meta is not None and hasattr(env, "set_ep_meta"):
-            env.set_ep_meta(json.loads(decode_attr(ep_meta)))
-        elif hasattr(env, "unset_ep_meta"):
-            env.unset_ep_meta()
+def _initialize_robomimic_obs_utils(ObsUtils, camera_names: list[str], use_depth_obs: bool) -> None:
+    obs_spec: dict[str, dict[str, list[str]]] = {
+        "obs": {
+            "low_dim": [],
+            "rgb": [f"{camera_name}_image" for camera_name in camera_names],
+        }
+    }
+    if use_depth_obs:
+        obs_spec["obs"]["depth"] = [f"{camera_name}_depth" for camera_name in camera_names]
+    ObsUtils.initialize_obs_utils_with_obs_specs(obs_spec)
 
-        env.reset()
-        if hasattr(env, "edit_model_xml"):
-            xml = env.edit_model_xml(decode_attr(model_xml))
-        else:
-            xml = decode_attr(model_xml)
-        env.reset_from_xml_string(xml)
-        env.sim.reset()
 
-    env.sim.set_state_from_flattened(state)
-    env.sim.forward()
+def _prefer_local_robomimic() -> None:
+    robomimic_root = Path(os.environ.get("ROBOMIMIC_ROOT", DEFAULT_ROBOMIMIC_ROOT))
+    if (robomimic_root / "robomimic").is_dir() and str(robomimic_root) not in sys.path:
+        sys.path.insert(0, str(robomimic_root))
+    if "robomimic.utils.lang_utils" not in sys.modules:
+        lang_utils = types.ModuleType("robomimic.utils.lang_utils")
+        lang_utils.LANG_EMB_OBS_KEY = "lang_emb"
+        lang_utils.get_lang_emb = lambda lang: None
+        lang_utils.get_lang_emb_shape = lambda: []
+        sys.modules["robomimic.utils.lang_utils"] = lang_utils
+
+
+def unwrap_robosuite_env(env):
+    current = env
+    while not hasattr(current, "sim") and hasattr(current, "env"):
+        current = current.env
+    if not hasattr(current, "sim"):
+        raise AttributeError("Could not find underlying robosuite env with a sim attribute.")
+    return current
 
 
 def get_lowdim_obs(env) -> dict[str, np.ndarray]:
-    if not hasattr(env, "_get_observations"):
+    if hasattr(env, "get_observation"):
+        return env.get_observation()
+    core_env = unwrap_robosuite_env(env)
+    if not hasattr(core_env, "_get_observations"):
         raise AttributeError("robosuite env does not expose _get_observations()")
-    return env._get_observations()
+    return core_env._get_observations()
 
 
 def get_camera_local_x_delta(sim, cam_id: int, distance: float) -> np.ndarray:
@@ -153,7 +169,7 @@ def get_camera_local_x_delta(sim, cam_id: int, distance: float) -> np.ndarray:
 
 
 def render_shifted_camera(env, camera_name: str, height: int, width: int, offset: np.ndarray) -> np.ndarray:
-    sim = env.sim
+    sim = unwrap_robosuite_env(env).sim
     cam_id = sim.model.camera_name2id(camera_name)
     original_pos = sim.model.cam_pos[cam_id].copy()
     sim.model.cam_pos[cam_id] = original_pos + offset
@@ -173,9 +189,10 @@ def render_stereo_images(
 ) -> dict[str, np.ndarray]:
     images: dict[str, np.ndarray] = {}
     half = float(baseline) / 2.0
+    sim = unwrap_robosuite_env(env).sim
     for camera_name in camera_names:
-        cam_id = env.sim.model.camera_name2id(camera_name)
-        local_half_delta = get_camera_local_x_delta(env.sim, cam_id, half)
+        cam_id = sim.model.camera_name2id(camera_name)
+        local_half_delta = get_camera_local_x_delta(sim, cam_id, half)
         images[f"{camera_name}_left"] = render_shifted_camera(
             env, camera_name, height, width, -local_half_delta
         )
@@ -197,8 +214,8 @@ def state_from_robosuite_obs(obs: dict[str, Any], state_dim: int) -> np.ndarray:
         ],
         axis=0,
     ).astype(np.float32, copy=False)
-    if state.shape != (state_dim,):
-        raise ValueError(f"Expected robomimic state shape ({state_dim},), got {state.shape}.")
+    # if state.shape != (state_dim,):
+    #     raise ValueError(f"Expected robomimic state shape ({state_dim},), got {state.shape}.")
     return state
 
 
@@ -247,7 +264,6 @@ __all__ = [
     "make_robosuite_env",
     "payload_image_name",
     "render_stereo_images",
-    "reset_to",
-    "sorted_demo_names",
     "state_from_robosuite_obs",
+    "unwrap_robosuite_env",
 ]

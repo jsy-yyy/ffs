@@ -6,9 +6,9 @@ CONFIG=${CONFIG:-configs/robomimic_square_eval.yaml}
 CLIENT_PYTHON=${CLIENT_PYTHON:-python3}
 SAVE_ROOT=${SAVE_ROOT:-outputs/robomimic_square_eval}
 DATASET=${DATASET:-/data/jsy/robomimic/datasets/square/ph/stereo_image_v15.hdf5}
-CKPT=${CKPT:-outputs/robomimic_square_rdt/latest.pt}
+CKPT=${CKPT:-outputs/robomimic_square_rdt_aligned/latest.pt}
 PORT=${PORT:-29068}
-TEST_NUM=${TEST_NUM:-20}
+TEST_NUM=${TEST_NUM:-50}
 HORIZON=${HORIZON:-400}
 SEED=${SEED:-0}
 MUJOCO_GL=${MUJOCO_GL:-egl}
@@ -44,4 +44,3 @@ if [ "$DRY_RUN" = "1" ] || [ "$DRY_RUN" = "true" ]; then
 fi
 
 NUMBA_DISABLE_JIT=1 PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}" "${cmd[@]}"
-

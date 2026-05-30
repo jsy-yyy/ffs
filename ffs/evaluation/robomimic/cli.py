@@ -23,8 +23,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-rollouts", type=int, default=None)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
-    parser.add_argument("--demo-offset", type=int, default=None)
-    parser.add_argument("--reset-mode", choices=["dataset", "random"], default=None)
     parser.add_argument("--execute-chunk-steps", type=int, default=None)
     parser.add_argument("--mujoco-gl", default=None)
     parser.add_argument("--render-gpu-device-id", type=int, default=None)
@@ -59,8 +57,6 @@ def _overrides(args: argparse.Namespace) -> dict[str, Any]:
         "n_rollouts": "n_rollouts",
         "horizon": "horizon",
         "seed": "seed",
-        "demo_offset": "demo_offset",
-        "reset_mode": "reset_mode",
         "mujoco_gl": "mujoco_gl",
         "render_gpu_device_id": "render_gpu_device_id",
     }.items():

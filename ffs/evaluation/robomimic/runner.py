@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import h5py
 import imageio.v2 as imageio
 import numpy as np
 
@@ -15,14 +14,10 @@ from .env_utils import (
     apply_runtime_env,
     camera_names_from_pairs,
     check_success,
-    decode_attr,
-    get_lowdim_obs,
     load_env_meta,
     make_observation_payload,
     make_robosuite_env,
     payload_image_name,
-    reset_to,
-    sorted_demo_names,
 )
 from .wire import recv_msg, send_msg
 
@@ -44,10 +39,13 @@ class RobomimicPolicyClient:
         self.port = int(port)
         self.sock: socket.socket | None = None
 
-    def setup(self) -> None:
+    def setup(self, seed: int | None = None) -> None:
         self.sock = socket.create_connection((self.host, self.port))
         send_msg(self.sock, {"cmd": "ping"})
         self._recv_ok()
+        if seed is not None:
+            send_msg(self._socket(), {"cmd": "set_seed", "seed": int(seed)})
+            self._recv_ok()
 
     def reset(self, task_name: str, seed: int, episode_id: int) -> None:
         send_msg(
@@ -113,7 +111,6 @@ class RobomimicEvaluator:
         self.dataset_path = Path(config.env.dataset_path)
         self.env_meta = load_env_meta(self.dataset_path)
         self.task_name = str(self.env_meta.get("env_name", "robomimic"))
-        self.demo_names = sorted_demo_names(self.dataset_path)
 
     def dry_run_summary(self) -> dict[str, Any]:
         return {
@@ -125,8 +122,10 @@ class RobomimicEvaluator:
             "camera_pairs": self.camera_pairs,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
-            "n_demos": len(self.demo_names),
-            "first_demo": self.demo_names[0] if self.demo_names else None,
+            "reset": "robomimic_env_reset",
+            "n_rollouts": int(self.config.env.n_rollouts),
+            "horizon": int(self.config.env.horizon),
+            "seed": int(self.config.env.seed),
             "render": {
                 "height": self.camera_height,
                 "width": self.camera_width,
@@ -148,11 +147,27 @@ class RobomimicEvaluator:
             camera_width=self.camera_width,
             render_gpu_device_id=self.config.env.render_gpu_device_id,
         )
-        self.policy.setup()
+        np.random.seed(int(self.config.env.seed))
+        self.policy.setup(seed=int(self.config.env.seed))
         results: list[EpisodeResult] = []
         try:
             for episode_id in range(int(self.config.env.n_rollouts)):
-                result = self.run_episode(env, episode_id)
+                try:
+                    result = self.run_episode(env, episode_id)
+                except Exception as exc:
+                    rollout_exceptions = getattr(env, "rollout_exceptions", ())
+                    if not rollout_exceptions or not isinstance(exc, rollout_exceptions):
+                        raise
+                    print(f"WARNING: got rollout exception {exc}", flush=True)
+                    result = EpisodeResult(
+                        task_name=self.task_name,
+                        seed=int(self.config.env.seed),
+                        episode_id=int(episode_id),
+                        demo_name=None,
+                        success=False,
+                        horizon=0,
+                        ret=0.0,
+                    )
                 results.append(result)
                 self._write_episode(result)
                 print(
@@ -169,20 +184,9 @@ class RobomimicEvaluator:
                 env.close()
 
     def run_episode(self, env, episode_id: int) -> EpisodeResult:
-        seed = int(self.config.env.seed) + int(episode_id)
-        np.random.seed(seed)
-        demo_name = None
-        if self.config.env.reset_mode == "dataset":
-            demo_name = self._reset_to_dataset_demo(env, episode_id)
-            lowdim_obs = get_lowdim_obs(env)
-        elif self.config.env.reset_mode == "random":
-            if hasattr(env, "seed"):
-                env.seed(seed)
-            lowdim_obs = env.reset()
-        else:
-            raise ValueError("env.reset_mode must be one of: dataset, random.")
-
+        seed = int(self.config.env.seed)
         self.policy.reset(self.task_name, seed=seed, episode_id=episode_id)
+        lowdim_obs = env.reset()
         step = 0
         ret = 0.0
         success = False
@@ -230,26 +234,11 @@ class RobomimicEvaluator:
             task_name=self.task_name,
             seed=seed,
             episode_id=episode_id,
-            demo_name=demo_name,
+            demo_name=None,
             success=bool(success),
             horizon=int(step),
             ret=float(ret),
         )
-
-    def _reset_to_dataset_demo(self, env, episode_id: int) -> str:
-        if not self.demo_names:
-            raise ValueError(f"No demos found in {self.dataset_path}")
-        demo_idx = (int(self.config.env.demo_offset) + int(episode_id)) % len(self.demo_names)
-        demo_name = self.demo_names[demo_idx]
-        with h5py.File(self.dataset_path, "r") as f:
-            demo = f[f"data/{demo_name}"]
-            reset_to(
-                env,
-                np.asarray(demo["states"][0]),
-                model_xml=demo.attrs.get("model_file"),
-                ep_meta=demo.attrs.get("ep_meta"),
-            )
-        return demo_name
 
     def _payload(self, env, lowdim_obs: dict[str, Any], step: int) -> dict[str, Any]:
         return make_observation_payload(
@@ -313,6 +302,10 @@ class RobomimicEvaluator:
             "succ_rate": float(success / len(results)),
             "avg_horizon": float(np.mean(horizons)),
             "avg_return": float(np.mean(returns)),
+            "Num_Success": float(success),
+            "Success_Rate": float(success / len(results)),
+            "Horizon": float(np.mean(horizons)),
+            "Return": float(np.mean(returns)),
         }
 
 
@@ -325,22 +318,10 @@ def video_frame_from_payload(obs: dict[str, Any], camera_pairs: list[list[str]])
     return np.concatenate(frames, axis=1)
 
 
-def demo_metadata(dataset_path: str | Path, demo_name: str) -> dict[str, Any]:
-    with h5py.File(dataset_path, "r") as f:
-        demo = f[f"data/{demo_name}"]
-        return {
-            "num_samples": int(demo.attrs.get("num_samples", demo["states"].shape[0])),
-            "model_file": bool(demo.attrs.get("model_file") is not None),
-            "ep_meta": decode_attr(demo.attrs.get("ep_meta")) if demo.attrs.get("ep_meta") is not None else None,
-        }
-
-
 __all__ = [
     "EpisodeResult",
     "RobomimicEvaluator",
     "RobomimicPolicyClient",
-    "demo_metadata",
     "select_action_steps",
     "video_frame_from_payload",
 ]
-

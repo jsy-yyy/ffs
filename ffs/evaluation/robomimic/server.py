@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 import socket
 import sys
 import traceback
@@ -26,6 +27,7 @@ class RobomimicFFSService:
         device: str,
         amp: bool = True,
         sample_init: str | None = None,
+        clip_sample: bool | None = None,
         disparity_ablation: str = "none",
         debug_actions: bool = False,
     ) -> None:
@@ -67,8 +69,19 @@ class RobomimicFFSService:
         state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
         self.model.load_state_dict(state_dict)
         self.model.eval()
-        if sample_init is not None and hasattr(self.model.action_head, "sample_init"):
-            self.model.action_head.sample_init = sample_init
+        _apply_action_head_runtime_overrides(
+            self.model.action_head,
+            sample_init=sample_init,
+            clip_sample=clip_sample,
+        )
+
+    def set_seed(self, seed: int) -> None:
+        seed = int(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
 
     def reset(
         self,
@@ -184,6 +197,18 @@ class RobomimicFFSService:
         return tensor
 
 
+def _apply_action_head_runtime_overrides(
+    action_head: Any,
+    *,
+    sample_init: str | None,
+    clip_sample: bool | None,
+) -> None:
+    if sample_init is not None and hasattr(action_head, "sample_init"):
+        action_head.sample_init = sample_init
+    if clip_sample is not None and hasattr(action_head, "clip_sample"):
+        action_head.clip_sample = bool(clip_sample)
+
+
 def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {"policy": {}}
     for arg_name, cfg_name in {
@@ -193,6 +218,7 @@ def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "config_path": "config_path",
         "device": "device",
         "sample_init": "sample_init",
+        "clip_sample": "clip_sample",
         "disparity_ablation": "disparity_ablation",
     }.items():
         value = getattr(args, arg_name)
@@ -212,6 +238,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config-path", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--sample-init", choices=["randn", "zeros"], default=None)
+    clip_sample_group = parser.add_mutually_exclusive_group()
+    clip_sample_group.add_argument("--clip-sample", dest="clip_sample", action="store_true")
+    clip_sample_group.add_argument("--no-clip-sample", dest="clip_sample", action="store_false")
+    parser.set_defaults(clip_sample=None)
     parser.add_argument("--disparity-ablation", choices=["none", "zero", "shuffle"], default=None)
     parser.add_argument("--no-amp", action="store_true")
     return parser.parse_args()
@@ -225,6 +255,7 @@ def build_service(config: EvalConfig) -> RobomimicFFSService:
         device=config.policy.device,
         amp=config.policy.amp,
         sample_init=config.policy.sample_init,
+        clip_sample=config.policy.clip_sample,
         disparity_ablation=config.policy.disparity_ablation,
         debug_actions=config.policy.debug_actions,
     )
@@ -269,6 +300,9 @@ def main() -> None:
                         elif cmd == "update":
                             service.update(req.get("observations", []))
                             send_msg(conn, {"ok": True})
+                        elif cmd == "set_seed":
+                            service.set_seed(req["seed"])
+                            send_msg(conn, {"ok": True})
                         elif cmd == "ping":
                             send_msg(conn, {"ok": True})
                         else:
@@ -281,4 +315,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
