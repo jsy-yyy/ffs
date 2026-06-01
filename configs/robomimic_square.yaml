@@ -1,11 +1,15 @@
 backbone:
-  foundation_root: /data/jsy/Fast-FoundationStereo
-  checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
-  feature_names: [feat_04, feat_32]
-  freeze: true
-  valid_iters: 4
-  max_disp: 192
-  optimize_build_volume: pytorch1
+  type: cnn-based
+  image_size: [224, 224]
+  use_left_only: true
+  rgb:
+    feature_dimension: 64
+    backbone_class: ResNet18Conv
+    pool_class: SpatialSoftmax
+    num_kp: 32
+    crop_height: 216
+    crop_width: 216
+    replace_bn_with_gn: true
 
 dataset:
   type: robomimic-stereo-lerobot
@@ -16,61 +20,39 @@ dataset:
     - [observation.images.agentview_left, observation.images.agentview_right]
     - [observation.images.robot0_eye_in_hand_left, observation.images.robot0_eye_in_hand_right]
   action_normalization:
-    method: quantile
-    normalize_indices: [0, 1, 2, 3, 4, 5, 6]
-    stats:
-      q01: [-0.5420234875193051, -0.49978102449809264, -0.7431031955698542, -0.07038834379857999, -0.10083929680221491, -0.25879100838619457, -1.0]
-      q99: [0.9970069651864254, 0.7671304940362492, 0.9481036908195938, 0.07606787359307764, 0.15165477592950483, 0.27189579713040773, 0.9999922927457302]
+    # method: quantile
+    # normalize_indices: [0, 1, 2, 3, 4, 5, 6]
+    # stats:
+    #   q01: [-0.5420234875193051, -0.49978102449809264, -0.7431031955698542, -0.07038834379857999, -0.10083929680221491, -0.25879100838619457, -1.0]
+    #   q99: [0.9970069651864254, 0.7671304940362492, 0.9481036908195938, 0.07606787359307764, 0.15165477592950483, 0.27189579713040773, 0.9999922927457302]
 
 policy:
   num_history_frames: 2
-  action_horizon: 16
+  observation_horizon: 2
+  action_horizon: 8
+  prediction_horizon: 16
   action_dim: 7
   state_dim: 23
-  use_disparity: true
-  disparity_ablation: none
 
 head:
-  type: rdt
-  condition_token_dim: 256
-  feature_queries_per_scale: 2
-  disp_queries: 2
-  spatial_query_num_heads: 8
-  use_disparity_tokens: true
-  disparity_fusion:
-    enabled: true
-    feature_names: [feat_04, feat_32]
-    input_mode: disp_xy
-    hidden_channels: 16
-    output_channels: 16
-    num_layers: 2
-  mlp:
-    hidden_dim: 512
-    num_blocks: 10
-    dropout: 0.0
-  rdt:
-    hidden_size: 256
-    depth: 4
-    num_heads: 8
-    num_kv_heads: 8
-    norm_eps: 1.0e-5
-    multiple_of: 256
-    ffn_dim_multiplier:
-    use_flash_attn: true
-    num_register_tokens: 4
-    num_inference_steps: 10
-    sample_init: randn
-    clip_sample: true
-    act_adaptor: mlp3x_silu
-    state_adaptor: mlp3x_silu
-    img_adaptor: linear
-    dtype: float32
+  type: diffusion_unet
+  diffusion_unet:
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
+    ddpm:
+      num_train_timesteps: 100
+      num_inference_timesteps: 100
+      beta_schedule: squaredcos_cap_v2
+      clip_sample: true
+      prediction_type: epsilon
 
 train:
-  output_dir: outputs/robomimic_square_rdt_disp_fusion
+  output_dir: outputs/robomimic_square_diffusion_aligned
   epochs: 500
   epoch_every_n_steps: 100
-  batch_size: 8
+  batch_size: 64
   num_workers: 4
   lr: 1e-4
   weight_decay: 1.0e-6
@@ -82,6 +64,11 @@ train:
   log_interval: 50
   save_ckpt_interval: 5000
   resume_from: 
+  ema:
+    enabled: true
+    power: 0.75
+    inv_gamma: 1.0
+    max_decay: 0.9999
 
 visualization:
   query_attention:

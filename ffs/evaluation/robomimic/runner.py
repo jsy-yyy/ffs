@@ -109,7 +109,7 @@ class RobomimicEvaluator:
         self.camera_width = int(config.env.camera_width or self.image_size[1])
         self.stereo_baseline = float(config.env.stereo_baseline or 0.06)
         self.dataset_path = Path(config.env.dataset_path)
-        self.env_meta = load_env_meta(self.dataset_path)
+        self.env_meta = _load_checkpoint_env_meta(config.policy.checkpoint) or load_env_meta(self.dataset_path)
         self.task_name = str(self.env_meta.get("env_name", "robomimic"))
 
     def dry_run_summary(self) -> dict[str, Any]:
@@ -187,6 +187,8 @@ class RobomimicEvaluator:
         seed = int(self.config.env.seed)
         self.policy.reset(self.task_name, seed=seed, episode_id=episode_id)
         lowdim_obs = env.reset()
+        if hasattr(env, "get_state") and hasattr(env, "reset_to"):
+            lowdim_obs = env.reset_to(env.get_state())
         step = 0
         ret = 0.0
         success = False
@@ -316,6 +318,21 @@ def video_frame_from_payload(obs: dict[str, Any], camera_pairs: list[list[str]])
         frames.append(np.asarray(images[payload_image_name(left_key)], dtype=np.uint8))
         frames.append(np.asarray(images[payload_image_name(right_key)], dtype=np.uint8))
     return np.concatenate(frames, axis=1)
+
+
+def _load_checkpoint_env_meta(checkpoint: str | Path) -> dict[str, Any] | None:
+    path = Path(checkpoint)
+    if not path.is_file():
+        return None
+    try:
+        import torch
+
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    if isinstance(ckpt, dict) and isinstance(ckpt.get("env_metadata"), dict):
+        return dict(ckpt["env_metadata"])
+    return None
 
 
 __all__ = [

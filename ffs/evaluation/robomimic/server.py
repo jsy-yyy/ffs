@@ -5,6 +5,7 @@ import random
 import socket
 import sys
 import traceback
+from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,7 @@ class RobomimicFFSService:
         config_path: str | Path | None,
         device: str,
         amp: bool = True,
+        use_ema: bool = True,
         sample_init: str | None = None,
         clip_sample: bool | None = None,
         disparity_ablation: str = "none",
@@ -37,6 +39,7 @@ class RobomimicFFSService:
 
         from ffs import load_config_for_checkpoint
         from ffs.datasets import ActionNormalizer
+        from ffs.ema import load_ema_state_dict
         from ffs.policies.stereo_action_policy import build_policy
 
         self.device = torch.device(device)
@@ -60,20 +63,30 @@ class RobomimicFFSService:
             "episode_id": "unknown",
         }
 
-        self.action_normalizer = ActionNormalizer(
+        self.model = build_policy(self.cfg).to(self.device)
+        ckpt = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        self.action_normalizer = _make_action_normalizer(
+            ActionNormalizer,
             self.cfg["dataset"].get("action_normalization"),
             self.action_dim,
+            ckpt,
         )
-        self.model = build_policy(self.cfg).to(self.device)
-        ckpt = torch.load(checkpoint, map_location=self.device)
-        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-        self.model.load_state_dict(state_dict)
+        self.weights_source = _load_checkpoint_model_state(
+            self.model,
+            ckpt,
+            use_ema=use_ema,
+            load_ema_state_dict_fn=load_ema_state_dict,
+        )
         self.model.eval()
-        _apply_action_head_runtime_overrides(
-            self.model.action_head,
-            sample_init=sample_init,
-            clip_sample=clip_sample,
-        )
+        action_head = getattr(self.model, "action_head", None)
+        if action_head is not None:
+            _apply_action_head_runtime_overrides(
+                action_head,
+                sample_init=sample_init,
+                clip_sample=clip_sample,
+            )
+        elif clip_sample is not None and hasattr(self.model, "noise_scheduler"):
+            self.model.noise_scheduler.clip_sample = bool(clip_sample)
 
     def set_seed(self, seed: int) -> None:
         seed = int(seed)
@@ -124,6 +137,7 @@ class RobomimicFFSService:
             "metadata": {
                 "config_source": self.config_source,
                 "history": len(obs_window),
+                "weights": self.weights_source,
             },
         }
 
@@ -209,6 +223,87 @@ def _apply_action_head_runtime_overrides(
         action_head.clip_sample = bool(clip_sample)
 
 
+def _load_checkpoint_model_state(
+    model: torch.nn.Module,
+    ckpt: Any,
+    *,
+    use_ema: bool,
+    load_ema_state_dict_fn: Any | None = None,
+) -> str:
+    state_dict, state_source = _checkpoint_model_state_dict(ckpt, use_ema=use_ema)
+    model.load_state_dict(state_dict)
+    if not use_ema or not isinstance(ckpt, dict):
+        return state_source
+    ema_state = ckpt.get("ema_model")
+    if not isinstance(ema_state, dict) or not ema_state:
+        return state_source
+    if load_ema_state_dict_fn is None:
+        from ffs.ema import load_ema_state_dict as load_ema_state_dict_fn
+
+    load_ema_state_dict_fn(model, ema_state)
+    return "ema"
+
+
+def _checkpoint_model_state_dict(ckpt: Any, use_ema: bool = False) -> tuple[dict[str, torch.Tensor], str]:
+    if not isinstance(ckpt, dict) or "model" not in ckpt:
+        return ckpt, "raw"
+
+    state_dict = ckpt["model"]
+    if isinstance(state_dict, dict) and isinstance(state_dict.get("nets"), dict):
+        if use_ema and isinstance(state_dict.get("ema"), dict) and state_dict["ema"]:
+            return _robomimic_nets_to_ffs_state_dict(state_dict["ema"]), "robomimic_ema"
+        return _robomimic_nets_to_ffs_state_dict(state_dict["nets"]), "robomimic_nets"
+    return state_dict, "raw"
+
+
+def _robomimic_nets_to_ffs_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    converted = OrderedDict()
+    for key, value in state_dict.items():
+        new_key = key
+        if new_key.startswith("policy."):
+            new_key = new_key[len("policy."):]
+        if new_key.startswith("obs_encoder."):
+            new_key = f"backbone.{new_key}"
+        if new_key.startswith("noise_pred_net."):
+            new_key = f"action_head.{new_key}"
+        new_key = new_key.replace("agentview_left_image", "agentview_image")
+        new_key = new_key.replace("robot0_eye_in_hand_left_image", "robot0_eye_in_hand_image")
+        converted[new_key] = value
+    return converted
+
+
+class _RobomimicActionNormalizer:
+    def __init__(self, stats: dict[str, Any], action_dim: int) -> None:
+        action_stats = stats.get("actions") if isinstance(stats, dict) else None
+        if not isinstance(action_stats, dict):
+            raise ValueError("robomimic action_normalization_stats must contain an 'actions' entry.")
+        scale = torch.as_tensor(action_stats["scale"], dtype=torch.float32).reshape(-1)
+        offset = torch.as_tensor(action_stats["offset"], dtype=torch.float32).reshape(-1)
+        if scale.numel() != action_dim or offset.numel() != action_dim:
+            raise ValueError(
+                "robomimic action_normalization_stats shape does not match action_dim="
+                f"{action_dim}: scale={tuple(scale.shape)} offset={tuple(offset.shape)}"
+            )
+        self.scale = scale
+        self.offset = offset
+
+    def denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        scale = self.scale.to(device=action.device, dtype=action.dtype)
+        offset = self.offset.to(device=action.device, dtype=action.dtype)
+        return action * scale + offset
+
+
+def _make_action_normalizer(
+    action_normalizer_cls: Any,
+    cfg: dict[str, Any] | None,
+    action_dim: int,
+    ckpt: Any,
+) -> Any:
+    if isinstance(ckpt, dict) and isinstance(ckpt.get("action_normalization_stats"), dict):
+        return _RobomimicActionNormalizer(ckpt["action_normalization_stats"], action_dim)
+    return action_normalizer_cls(cfg, action_dim)
+
+
 def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
     overrides: dict[str, Any] = {"policy": {}}
     for arg_name, cfg_name in {
@@ -217,6 +312,7 @@ def _config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint": "checkpoint",
         "config_path": "config_path",
         "device": "device",
+        "use_ema": "use_ema",
         "sample_init": "sample_init",
         "clip_sample": "clip_sample",
         "disparity_ablation": "disparity_ablation",
@@ -237,6 +333,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--config-path", default=None)
     parser.add_argument("--device", default=None)
+    use_ema_group = parser.add_mutually_exclusive_group()
+    use_ema_group.add_argument("--use-ema", dest="use_ema", action="store_true")
+    use_ema_group.add_argument("--no-ema", dest="use_ema", action="store_false")
+    parser.set_defaults(use_ema=None)
     parser.add_argument("--sample-init", choices=["randn", "zeros"], default=None)
     clip_sample_group = parser.add_mutually_exclusive_group()
     clip_sample_group.add_argument("--clip-sample", dest="clip_sample", action="store_true")
@@ -254,6 +354,7 @@ def build_service(config: EvalConfig) -> RobomimicFFSService:
         config_path=config.policy.config_path,
         device=config.policy.device,
         amp=config.policy.amp,
+        use_ema=config.policy.use_ema,
         sample_init=config.policy.sample_init,
         clip_sample=config.policy.clip_sample,
         disparity_ablation=config.policy.disparity_ablation,
@@ -274,7 +375,7 @@ def main() -> None:
             "robomimic FFS server listening on "
             f"{config.policy.host}:{config.policy.port} "
             f"checkpoint={config.policy.checkpoint} device={config.policy.device} "
-            f"config={service.config_source}",
+            f"config={service.config_source} weights={service.weights_source}",
             flush=True,
         )
         while True:

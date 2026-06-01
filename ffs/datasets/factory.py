@@ -27,12 +27,16 @@ def require_stereo_lerobot_dataset_type(dataset_cfg: dict[str, Any]) -> str:
 def build_stereo_lerobot_dataset(
     dataset_cfg: dict[str, Any],
     policy_cfg: dict[str, Any],
+    head_cfg: dict[str, Any] | None = None,
 ) -> Dataset:
     dataset_type = require_stereo_lerobot_dataset_type(dataset_cfg)
+    action_horizon = policy_cfg["action_horizon"]
+    if isinstance(head_cfg, dict) and head_cfg.get("type") == "diffusion_unet":
+        action_horizon = policy_cfg.get("prediction_horizon", action_horizon)
     dataset_kwargs = {
         "camera_pairs": dataset_cfg["camera_pairs"],
         "num_history_frames": policy_cfg["num_history_frames"],
-        "action_horizon": policy_cfg["action_horizon"],
+        "action_horizon": action_horizon,
         "image_size": dataset_cfg.get("image_size"),
         "episode_indices": dataset_cfg.get("episode_indices"),
         "num_episodes": dataset_cfg.get("num_episodes"),

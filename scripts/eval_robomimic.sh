@@ -4,9 +4,10 @@ set -e
 ROOT_DIR=${ROOT_DIR:-/data/jsy/ffs}
 CONFIG=${CONFIG:-configs/robomimic_square_eval.yaml}
 CLIENT_PYTHON=${CLIENT_PYTHON:-python3}
-SAVE_ROOT=${SAVE_ROOT:-outputs/robomimic_square_eval}
+SAVE_ROOT=${SAVE_ROOT:-outputs/robomimic_square_diffusion_eval}
 DATASET=${DATASET:-/data/jsy/robomimic/datasets/square/ph/stereo_image_v15.hdf5}
-CKPT=${CKPT:-outputs/robomimic_square_rdt_aligned/latest.pt}
+CKPT=${CKPT:-outputs/robomimic_square_diffusion_aligned/latest.pt}
+FFS_CONFIG_PATH=${FFS_CONFIG_PATH:-}
 PORT=${PORT:-29068}
 TEST_NUM=${TEST_NUM:-50}
 HORIZON=${HORIZON:-400}
@@ -32,6 +33,9 @@ cmd=("$CLIENT_PYTHON" -m ffs.evaluation.robomimic.cli
 
 if [ -n "$RENDER_GPU_DEVICE_ID" ]; then
     cmd+=(--render-gpu-device-id "$RENDER_GPU_DEVICE_ID")
+fi
+if [ -n "$FFS_CONFIG_PATH" ]; then
+    cmd+=(--config-path "$FFS_CONFIG_PATH")
 fi
 if [ -n "$EXECUTE_CHUNK_STEPS" ]; then
     cmd+=(--execute-chunk-steps "$EXECUTE_CHUNK_STEPS")

@@ -1,16 +1,17 @@
-save_root: outputs/robomimic_square_eval_aligned
+save_root: outputs/robomimic_square_diffusion_eval
 dry_run: false
 
 policy:
   host: 127.0.0.1
   port: 29068
   ffs_root: /data/jsy/ffs
-  checkpoint: outputs/robomimic_square_rdt_aligned/latest.pt
+  checkpoint: outputs/robomimic_square_diffusion_aligned/latest.pt
   config_path:
   device: cuda:0
   amp: true
+  use_ema: true
   sample_init: randn
-  clip_sample: false
+  clip_sample: true
   disparity_ablation: none
   debug_actions: false
 

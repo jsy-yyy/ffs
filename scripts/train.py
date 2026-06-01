@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ffs import load_config
 from ffs.datasets import build_stereo_lerobot_dataset
+from ffs.ema import ModelEMA, ema_config_from_train_cfg
 from ffs.policies.stereo_action_policy import build_policy
 
 
@@ -68,6 +69,10 @@ def autocast_context(device: torch.device, use_amp: bool) -> Any:
     return torch.amp.autocast(device_type=device.type, enabled=use_amp)
 
 
+def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    return model.module if isinstance(model, DistributedDataParallel) else model
+
+
 def make_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     train_cfg: dict[str, Any],
@@ -96,27 +101,30 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: Any,
+    ema: ModelEMA | None,
     epoch: int,
     step: int,
     next_step: int,
     global_step: int,
     cfg: dict[str, Any],
 ) -> None:
-    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-    torch.save(
-        {
-            "model": raw_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-            "epoch": epoch,
-            "step": step,
-            "next_step": next_step,
-            "global_step": global_step,
-            "config": cfg,
-        },
-        path,
-    )
+    raw_model = unwrap_model(model)
+    payload = {
+        "model": raw_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "epoch": epoch,
+        "step": step,
+        "next_step": next_step,
+        "global_step": global_step,
+        "config": cfg,
+    }
+    if ema is not None:
+        payload["ema_model"] = ema.state_dict()
+        payload["ema_step"] = ema.step
+        payload["ema_config"] = ema.config.as_dict()
+    torch.save(payload, path)
     if path.name == "latest.pt":
         eval_cfg = copy.deepcopy(cfg)
         if isinstance(eval_cfg.get("train"), dict):
@@ -131,11 +139,12 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: Any,
+    ema: ModelEMA | None,
     device: torch.device,
     is_main: bool = True,
 ) -> tuple[int, int, int]:
-    ckpt = torch.load(path, map_location=device)
-    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    raw_model = unwrap_model(model)
     raw_model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
@@ -144,6 +153,17 @@ def load_checkpoint(
     epoch = int(ckpt.get("epoch", 0))
     next_step = int(ckpt.get("next_step", int(ckpt.get("step", -1)) + 1))
     global_step = int(ckpt.get("global_step", 0))
+    if ema is not None:
+        ema_state = ckpt.get("ema_model") if isinstance(ckpt, dict) else None
+        if isinstance(ema_state, dict):
+            ema.load_state_dict(ema_state)
+            ema.step = int(ckpt.get("ema_step", global_step))
+            if is_main:
+                print(f"loaded EMA weights from {path}: ema_step={ema.step}")
+        else:
+            ema.reset(raw_model, step=0)
+            if is_main:
+                print(f"checkpoint {path} has no EMA weights; initialized EMA from raw model")
     if is_main:
         print(f"resumed from {path}: epoch={epoch} step={next_step} global_step={global_step}")
     return epoch, next_step, global_step
@@ -173,7 +193,7 @@ def make_loader(cfg: dict[str, Any], rank: int, world_size: int) -> tuple[DataLo
     policy_cfg = cfg["policy"]
     dataset_cfg = cfg["dataset"]
     train_cfg = cfg["train"]
-    dataset = build_stereo_lerobot_dataset(dataset_cfg, policy_cfg)
+    dataset = build_stereo_lerobot_dataset(dataset_cfg, policy_cfg, cfg.get("head", {}))
     if int(policy_cfg["state_dim"]) != dataset.state_dim:
         raise ValueError(
             f"policy.state_dim={policy_cfg['state_dim']} does not match dataset state_dim={dataset.state_dim}"
@@ -215,6 +235,10 @@ def train(args: argparse.Namespace) -> None:
     model = build_policy(cfg).to(device)
     if world_size > 1:
         model = DistributedDataParallel(model, device_ids=[local_rank])
+    ema_cfg = ema_config_from_train_cfg(train_cfg)
+    ema = ModelEMA(unwrap_model(model), ema_cfg) if ema_cfg is not None else None
+    if is_main and ema is not None:
+        print(f"EMA enabled: {ema.config.as_dict()} tracked_params={len(ema.shadow)}")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -234,7 +258,7 @@ def train(args: argparse.Namespace) -> None:
     resume_from = args.resume_from or train_cfg.get("resume_from")
     if resume_from:
         start_epoch, start_step, global_step = load_checkpoint(
-            resume_from, model, optimizer, scheduler, scaler, device, is_main=is_main
+            resume_from, model, optimizer, scheduler, scaler, ema, device, is_main=is_main
         )
         if start_step >= effective_epoch_steps:
             start_epoch += 1
@@ -282,6 +306,8 @@ def train(args: argparse.Namespace) -> None:
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            if ema is not None:
+                ema.update(unwrap_model(model))
 
             global_step += 1
             loss_value = float(loss.detach().cpu())
@@ -305,9 +331,9 @@ def train(args: argparse.Namespace) -> None:
                     )
 
             if is_main and save_ckpt_interval > 0 and global_step % save_ckpt_interval == 0:
-                save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, scaler,
+                save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, scaler, ema,
                                 epoch, step, step + 1, global_step, cfg)
-                save_checkpoint(output_dir / f"step_{global_step}.pt", model, optimizer, scheduler, scaler,
+                save_checkpoint(output_dir / f"step_{global_step}.pt", model, optimizer, scheduler, scaler, ema,
                                 epoch, step, step + 1, global_step, cfg)
 
             if stop_step is not None and global_step >= stop_step:
@@ -321,10 +347,10 @@ def train(args: argparse.Namespace) -> None:
         final_epoch = last_epoch if done else last_epoch + 1
         final_step = last_step if done else -1
         final_next_step = last_step + 1 if done else 0
-        save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, scaler,
+        save_checkpoint(output_dir / "latest.pt", model, optimizer, scheduler, scaler, ema,
                         final_epoch, final_step, final_next_step, global_step, cfg)
 
-    del model, optimizer, scheduler, scaler
+    del model, optimizer, scheduler, scaler, ema
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     cleanup_dist()

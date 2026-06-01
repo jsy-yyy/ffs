@@ -79,6 +79,9 @@ def make_robosuite_env(
     env_kwargs["camera_names"] = list(camera_names)
     env_kwargs["camera_heights"] = int(camera_height)
     env_kwargs["camera_widths"] = int(camera_width)
+    for key in ("stereo_baseline_m", "stereo_camera_names", "stereo_camera_info"):
+        if key in env_meta:
+            env_kwargs[key] = env_meta[key]
     if render_gpu_device_id is not None:
         env_kwargs["render_gpu_device_id"] = int(render_gpu_device_id)
     for key in (
@@ -100,14 +103,18 @@ def make_robosuite_env(
         major, minor = (1, 4)
     if major == 1 and minor < 5:
         env_kwargs.pop("lite_physics", None)
+        env_kwargs["controller_configs"] = _legacy_robosuite_controller_config(
+            env_kwargs.get("controller_configs")
+        )
 
-    _initialize_robomimic_obs_utils(ObsUtils, camera_names, use_depth_obs=False)
+    stereo_image_keys = [f"{camera_name}_{side}_image" for camera_name in camera_names for side in ("left", "right")]
+    _initialize_robomimic_obs_utils(ObsUtils, stereo_image_keys, use_depth_obs=False)
     env = EnvUtils.create_env(
         env_type=EnvUtils.get_env_type(env_meta=env_meta),
         env_name=env_meta["env_name"],
         render=False,
         render_offscreen=True,
-        use_image_obs=False,
+        use_image_obs=True,
         use_depth_obs=False,
         **env_kwargs,
     )
@@ -115,15 +122,35 @@ def make_robosuite_env(
     return env
 
 
-def _initialize_robomimic_obs_utils(ObsUtils, camera_names: list[str], use_depth_obs: bool) -> None:
+def _legacy_robosuite_controller_config(controller_configs: Any) -> Any:
+    if not isinstance(controller_configs, dict):
+        return controller_configs
+    body_parts = controller_configs.get("body_parts")
+    if not isinstance(body_parts, dict):
+        return controller_configs
+    right = body_parts.get("right")
+    if not isinstance(right, dict):
+        return controller_configs
+
+    legacy = dict(right)
+    legacy.pop("gripper", None)
+    legacy.pop("input_ref_frame", None)
+    if "damping" in legacy and "damping_ratio" not in legacy:
+        legacy["damping_ratio"] = legacy.pop("damping")
+    if "damping_limits" in legacy and "damping_ratio_limits" not in legacy:
+        legacy["damping_ratio_limits"] = legacy.pop("damping_limits")
+    return legacy
+
+
+def _initialize_robomimic_obs_utils(ObsUtils, rgb_keys: list[str], use_depth_obs: bool) -> None:
     obs_spec: dict[str, dict[str, list[str]]] = {
         "obs": {
             "low_dim": [],
-            "rgb": [f"{camera_name}_image" for camera_name in camera_names],
+            "rgb": list(rgb_keys),
         }
     }
     if use_depth_obs:
-        obs_spec["obs"]["depth"] = [f"{camera_name}_depth" for camera_name in camera_names]
+        obs_spec["obs"]["depth"] = [key.replace("_image", "_depth") for key in rgb_keys]
     ObsUtils.initialize_obs_utils_with_obs_specs(obs_spec)
 
 
@@ -203,6 +230,17 @@ def render_stereo_images(
 
 
 def state_from_robosuite_obs(obs: dict[str, Any], state_dim: int) -> np.ndarray:
+    if state_dim == 16:
+        return np.concatenate(
+            [
+                np.asarray(obs["robot0_joint_pos"], dtype=np.float32).reshape(-1),
+                np.asarray(obs["robot0_gripper_qpos"], dtype=np.float32).reshape(-1),
+                np.asarray(obs["robot0_eef_pos"], dtype=np.float32).reshape(-1),
+                np.asarray(obs["robot0_eef_quat"], dtype=np.float32).reshape(-1),
+            ],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
     object_obs = obs["object"] if "object" in obs else obs["object-state"]
 
     state = np.concatenate(
@@ -229,16 +267,28 @@ def make_observation_payload(
     stereo_baseline: float,
     state_dim: int,
 ) -> dict[str, Any]:
-    return {
-        "step": int(step),
-        "state": state_from_robosuite_obs(lowdim_obs, state_dim),
-        "images": render_stereo_images(
+    images: dict[str, np.ndarray] = {}
+    expected_image_names = [
+        f"{camera_name}_{side}"
+        for camera_name in camera_names
+        for side in ("left", "right")
+    ]
+    for image_name in expected_image_names:
+        env_key = f"{image_name}_image"
+        if env_key in lowdim_obs:
+            images[image_name] = np.asarray(lowdim_obs[env_key]).copy()
+    if len(images) != len(expected_image_names):
+        images = render_stereo_images(
             env,
             camera_names=camera_names,
             height=camera_height,
             width=camera_width,
             baseline=stereo_baseline,
-        ),
+        )
+    return {
+        "step": int(step),
+        "state": state_from_robosuite_obs(lowdim_obs, state_dim),
+        "images": images,
     }
 
 

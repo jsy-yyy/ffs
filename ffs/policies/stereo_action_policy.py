@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from ffs.backbones import FoundationStereoBackbone
 from ffs.heads import ActionHead, build_action_head
+from ffs.policies.robomimic_diffusion_policy import build_robomimic_diffusion_policy
 
 
 def _sincos_1d_pos_embed(dim: int, pos: torch.Tensor) -> torch.Tensor:
@@ -493,6 +494,27 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
     backbone_cfg = cfg["backbone"]
     policy_cfg = cfg["policy"]
     head_cfg = cfg.get("head", {})
+    backbone_type = backbone_cfg.get("type", "ffs-based")
+    head_type = head_cfg.get("type", "mlp")
+
+    if backbone_type == "cnn-based":
+        if head_type != "diffusion_unet":
+            raise ValueError(
+                "backbone.type='cnn-based' currently requires head.type='diffusion_unet'. "
+                f"Got head.type={head_type!r}."
+            )
+        return build_robomimic_diffusion_policy(
+            backbone_cfg=backbone_cfg,
+            policy_cfg=policy_cfg,
+            head_cfg=head_cfg,
+            image_size=cfg.get("dataset", {}).get("image_size", [224, 224]),
+        )
+
+    if backbone_type != "ffs-based":
+        raise ValueError("backbone.type must be one of: cnn-based, ffs-based.")
+    if head_type == "diffusion_unet":
+        raise ValueError("head.type='diffusion_unet' is only supported with backbone.type='cnn-based'.")
+
     dataset_cfg = cfg.get("dataset", {})
     action_head_cfg = resolve_action_head_cfg(head_cfg)
     num_stereo_pairs = len(dataset_cfg.get("camera_pairs", []))

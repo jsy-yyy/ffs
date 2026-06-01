@@ -11,12 +11,16 @@ def load_config(path: str | Path) -> dict[str, Any]:
         return yaml.safe_load(f)
 
 
-def _checkpoint_config_candidates(checkpoint_path: Path) -> list[Path]:
+def checkpoint_config_candidates(checkpoint_path: str | Path) -> list[Path]:
+    checkpoint_path = Path(checkpoint_path)
     candidates = [
         checkpoint_path.with_suffix(".yaml"),
         checkpoint_path.parent / "latest.yaml",
         checkpoint_path.parent / "config.yaml",
     ]
+    candidates.extend(sorted(checkpoint_path.parent.glob("*.yaml")))
+    candidates.extend(sorted(checkpoint_path.parent.glob("*.yml")))
+
     deduped = []
     seen = set()
     for candidate in candidates:
@@ -39,7 +43,7 @@ def load_config_for_checkpoint(
         raise ValueError("checkpoint_path is required when config_path is not provided.")
 
     checkpoint = Path(checkpoint_path)
-    candidates = _checkpoint_config_candidates(checkpoint)
+    candidates = checkpoint_config_candidates(checkpoint)
     for candidate in candidates:
         if candidate.is_file():
             return load_config(candidate), f"sidecar:{candidate}"
@@ -54,7 +58,7 @@ def load_config_for_checkpoint(
 
     import torch
 
-    ckpt = torch.load(checkpoint, map_location="cpu")
+    ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if isinstance(ckpt, dict) and isinstance(ckpt.get("config"), dict):
         return ckpt["config"], f"checkpoint:{checkpoint}#config"
     raise ValueError(

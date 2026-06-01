@@ -6,10 +6,11 @@ CONFIG=${CONFIG:-configs/robomimic_square_eval.yaml}
 SERVER_PYTHON=${SERVER_PYTHON:-python3}
 PORT=${PORT:-29068}
 DEVICE=${DEVICE:-cuda:0}
-CKPT=${CKPT:-outputs/robomimic_square_rdt_aligned/latest.pt}
+CKPT=${CKPT:-outputs/robomimic_square_diffusion_aligned/latest.pt}
 FFS_CONFIG_PATH=${FFS_CONFIG_PATH:-}
 SAMPLE_INIT=${SAMPLE_INIT:-}
 DISPARITY_ABLATION=${DISPARITY_ABLATION:-}
+USE_EMA=${USE_EMA:-}
 
 cd "$ROOT_DIR"
 
@@ -28,5 +29,13 @@ fi
 if [ -n "$DISPARITY_ABLATION" ]; then
     cmd+=(--disparity-ablation "$DISPARITY_ABLATION")
 fi
+case "${USE_EMA,,}" in
+    1|true|yes|on)
+        cmd+=(--use-ema)
+        ;;
+    0|false|no|off)
+        cmd+=(--no-ema)
+        ;;
+esac
 
 PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}" "${cmd[@]}"

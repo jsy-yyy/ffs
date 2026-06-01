@@ -74,10 +74,17 @@ dataset:
     - [observation.images.robot0_eye_in_hand_left, observation.images.robot0_eye_in_hand_right]
 ```
 
-## Action heads
+## Policy architecture
 
-The action head is selected by `head.type` in `configs/default.yaml`.
-Available types are:
+The model architecture is selected by `backbone.type` and `head.type`.
+
+- `backbone.type: ffs-based` uses the FoundationStereo feature backbone and
+  supports `head.type: mlp` or `head.type: rdt`.
+- `backbone.type: cnn-based` uses the local robomimic-style CNN observation encoder
+  (`VisualCore` with `ResNet18Conv` and `SpatialSoftmax`) and supports
+  `head.type: diffusion_unet`.
+
+Available FFS action heads are:
 
 - `mlp`: flatten history tokens and regress the action chunk directly.
 - `rdt`: RDT-style flow-matching denoising head inspired by
@@ -87,6 +94,7 @@ Example RDT config:
 
 ```yaml
 backbone:
+  type: ffs-based
   feature_names: [feat_04, feat_08, feat_16, feat_32]
 
 head:
@@ -100,6 +108,23 @@ head:
     depth: 4
     num_heads: 8
     num_inference_steps: 10
+```
+
+Example robomimic-style diffusion config:
+
+```yaml
+backbone:
+  type: cnn-based
+  image_size: [224, 224]
+  use_left_only: true
+
+head:
+  type: diffusion_unet
+  diffusion_unet:
+    diffusion_step_embed_dim: 256
+    down_dims: [256, 512, 1024]
+    kernel_size: 5
+    n_groups: 8
 ```
 
 ## Smoke test
@@ -279,6 +304,8 @@ Useful overrides:
 - `SAVE_VIDEO=1`: write rollout videos.
 - `SAMPLE_INIT=zeros|randn` and `DISPARITY_ABLATION=none|zero|shuffle`: server
   inference controls.
+- `USE_EMA=0|1`: enable or disable EMA checkpoint weights when present; enabled
+  by default in `configs/robomimic_square_eval.yaml`.
 
 The client writes results under:
 

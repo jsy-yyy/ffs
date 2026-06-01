@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ffs.argparse_compat import add_boolean_optional_argument
 from ffs import load_config_for_checkpoint
 from ffs.datasets.lerobot import relative_action_to_absolute_eef_pose
-from scripts.eval_offline import autocast_context, load_model, make_loader
+from scripts.eval_offline import align_targets_to_prediction, autocast_context, load_model, make_loader
 
 
 DEFAULT_MLP_CHECKPOINT = "outputs/mlp_seed0_overfit_500/latest.pt"
@@ -111,6 +111,12 @@ def evaluate_model(
 
             with autocast_context(device, use_amp):
                 pred = model(left, right, state)
+                if is_robotwin:
+                    action, relative_action, absolute_action = align_targets_to_prediction(
+                        cfg, pred, action, relative_action, absolute_action
+                    )
+                else:
+                    action, raw_action = align_targets_to_prediction(cfg, pred, action, raw_action)
                 normalized_mse = F.mse_loss(pred, action, reduction="sum")
                 normalized_mae = F.l1_loss(pred, action, reduction="sum")
                 pred_denorm = dataset.denormalize_action(pred.float())

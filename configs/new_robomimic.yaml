@@ -1,0 +1,104 @@
+backbone:
+  type: ffs-based
+  foundation_root: /data/jsy/Fast-FoundationStereo
+  checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
+  feature_names: [feat_04, feat_32]
+  freeze: true
+  valid_iters: 4
+  max_disp: 192
+  optimize_build_volume: pytorch1
+
+dataset:
+  type: robomimic-stereo-lerobot
+  root: /data/jsy/robomimic/robomimic_lerobot_square_dataset
+  image_size: [224, 224]
+  num_episodes: 100
+  camera_pairs:
+    - [observation.images.agentview_left, observation.images.agentview_right]
+    - [observation.images.robot0_eye_in_hand_left, observation.images.robot0_eye_in_hand_right]
+  action_normalization:
+    method: quantile
+    normalize_indices: [0, 1, 2, 3, 4, 5, 6]
+    stats:
+      q01: [-0.5420234875193051, -0.49978102449809264, -0.7431031955698542, -0.07038834379857999, -0.10083929680221491, -0.25879100838619457, -1.0]
+      q99: [0.9970069651864254, 0.7671304940362492, 0.9481036908195938, 0.07606787359307764, 0.15165477592950483, 0.27189579713040773, 0.9999922927457302]
+
+policy:
+  num_history_frames: 2
+  observation_horizon: 2
+  action_horizon: 8
+  prediction_horizon: 16
+  action_dim: 7
+  state_dim: 23
+  use_disparity: true
+  disparity_ablation: none
+
+head:
+  type: rdt
+  condition_token_dim: 256
+  feature_queries_per_scale: 2
+  disp_queries: 4
+  spatial_query_num_heads: 8
+  use_disparity_tokens: true
+  disparity_fusion:
+    enabled: false
+    feature_names: [feat_04, feat_32]
+    input_mode: disp_xy
+    hidden_channels: 16
+    output_channels: 16
+    num_layers: 2
+  mlp:
+    hidden_dim: 512
+    num_blocks: 10
+    dropout: 0.0
+  rdt:
+    hidden_size: 256
+    depth: 4
+    num_heads: 8
+    num_kv_heads: 8
+    norm_eps: 1.0e-5
+    multiple_of: 256
+    ffn_dim_multiplier:
+    use_flash_attn: true
+    num_register_tokens: 4
+    num_inference_steps: 100
+    sample_init: randn
+    clip_sample: false
+    act_adaptor: mlp3x_silu
+    state_adaptor: mlp3x_silu
+    img_adaptor: linear
+    dtype: float32
+
+train:
+  output_dir: outputs/robomimic_square_tmp
+  epochs: 5000
+  epoch_every_n_steps: 100
+  batch_size: 8
+  num_workers: 4
+  lr: 1e-4
+  weight_decay: 1.0e-6
+  scheduler_type: cosine
+  warmup_steps: 500
+  num_cycles: 0.5
+  amp: true
+  suppress_dynamo_errors: true
+  log_interval: 50
+  save_ckpt_interval: 5000
+  resume_from: 
+  ema:
+    enabled: true
+    power: 0.75
+    inv_gamma: 1.0
+    max_decay: 0.9999
+
+visualization:
+  query_attention:
+    enabled: false
+    mode: all
+    sources: all
+    view: all
+    time: -1
+    query: all
+    fps: 10
+    alpha: 0.45
+    max_frames: 200

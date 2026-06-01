@@ -38,7 +38,7 @@ def make_loader(cfg: dict[str, Any], batch_size: int | None, num_workers: int | 
     policy_cfg = cfg["policy"]
     dataset_cfg = cfg["dataset"]
     train_cfg = cfg.get("train", {})
-    dataset = build_stereo_lerobot_dataset(dataset_cfg, policy_cfg)
+    dataset = build_stereo_lerobot_dataset(dataset_cfg, policy_cfg, cfg.get("head", {}))
     if int(policy_cfg["state_dim"]) != dataset.state_dim:
         raise ValueError(
             f"policy.state_dim={policy_cfg['state_dim']} does not match dataset state_dim={dataset.state_dim}"
@@ -59,10 +59,30 @@ def make_loader(cfg: dict[str, Any], batch_size: int | None, num_workers: int | 
 
 def load_model(cfg: dict[str, Any], checkpoint_path: str | Path, device: torch.device) -> torch.nn.Module:
     model = build_policy(cfg).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state_dict)
     return model
+
+
+def align_targets_to_prediction(
+    cfg: dict[str, Any],
+    pred: torch.Tensor,
+    *targets: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    if not targets or targets[0].shape[1] == pred.shape[1]:
+        return targets
+    policy_cfg = cfg.get("policy", {})
+    start = int(policy_cfg.get("observation_horizon", policy_cfg.get("num_history_frames", 1))) - 1
+    end = start + pred.shape[1]
+    aligned = []
+    for target in targets:
+        if target.shape[1] < end:
+            raise ValueError(
+                f"Prediction horizon {pred.shape[1]} with start {start} exceeds target shape {tuple(target.shape)}."
+            )
+        aligned.append(target[:, start:end])
+    return tuple(aligned)
 
 
 def resolve_query_attention_config(args: argparse.Namespace, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -162,6 +182,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, float | int | str | list[str
                 else:
                     pred = model(left, right, state)
                     attention = None
+                if is_robotwin:
+                    action, relative_action, absolute_action = align_targets_to_prediction(
+                        cfg, pred, action, relative_action, absolute_action
+                    )
+                else:
+                    action, raw_action = align_targets_to_prediction(cfg, pred, action, raw_action)
                 normalized_mse = F.mse_loss(pred, action, reduction="sum")
                 normalized_mae = F.l1_loss(pred, action, reduction="sum")
                 pred_denorm = dataset.denormalize_action(pred.float())

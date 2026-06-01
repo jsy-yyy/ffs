@@ -6,16 +6,19 @@ from typing import Any
 
 import yaml
 
+from ffs.config import checkpoint_config_candidates
+
 
 @dataclass
 class PolicyConfig:
     host: str = "127.0.0.1"
     port: int = 29068
     ffs_root: str = "/data/jsy/ffs"
-    checkpoint: str = "outputs/robomimic_square_rdt/latest.pt"
+    checkpoint: str = "outputs/robomimic_square_diffusion_aligned/latest.pt"
     config_path: str | None = None
     device: str = "cuda:0"
     amp: bool = True
+    use_ema: bool = True
     sample_init: str | None = "zeros"
     clip_sample: bool | None = None
     disparity_ablation: str = "none"
@@ -89,11 +92,7 @@ def resolve_ffs_config_path(checkpoint: str | Path, explicit_config: str | Path 
         return Path(explicit_config)
 
     checkpoint_path = Path(checkpoint)
-    candidates = [
-        checkpoint_path.with_suffix(".yaml"),
-        checkpoint_path.parent / "latest.yaml",
-        checkpoint_path.parent / "config.yaml",
-    ]
+    candidates = checkpoint_config_candidates(checkpoint_path)
     for candidate in candidates:
         if candidate.is_file():
             return candidate
