@@ -7,9 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ffs.backbones import FoundationStereoBackbone
+from ffs.backbones import FoundationStereoBackbone, WAFTStereoBackbone
 from ffs.heads import ActionHead, build_action_head
-from ffs.policies.robomimic_diffusion_policy import build_robomimic_diffusion_policy
+from ffs.policies.robomimic_diffusion_policy import (
+    build_robomimic_diffusion_policy,
+    build_spatial_backbone_diffusion_policy,
+)
 
 
 def _sincos_1d_pos_embed(dim: int, pos: torch.Tensor) -> torch.Tensor:
@@ -490,6 +493,45 @@ def resolve_action_head_cfg(head_cfg: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in head_cfg.items() if k not in reserved_keys}
 
 
+def build_cnn_disparity_provider(backbone_cfg: dict[str, Any]) -> tuple[nn.Module | None, int | None]:
+    disparity_cfg = backbone_cfg.get("disparity")
+    if not isinstance(disparity_cfg, dict) or not bool(disparity_cfg.get("enabled", False)):
+        return None, None
+
+    source = str(disparity_cfg.get("source", "ffs"))
+    if source not in {"ffs", "waft"}:
+        raise ValueError("backbone.disparity.source must be one of: ffs, waft.")
+    default_max_disp = 192 if source == "ffs" else 800
+    max_disp = int(disparity_cfg.get("max_disp", default_max_disp))
+    freeze = bool(disparity_cfg.get("freeze", True))
+
+    if source == "ffs":
+        ffs_cfg = dict(disparity_cfg.get("ffs") or {})
+        provider = FoundationStereoBackbone(
+            foundation_root=ffs_cfg["foundation_root"],
+            checkpoint_path=ffs_cfg["checkpoint_path"],
+            valid_iters=ffs_cfg.get("valid_iters", 4),
+            max_disp=max_disp,
+            freeze=freeze,
+            use_disparity=True,
+            optimize_build_volume=ffs_cfg.get("optimize_build_volume", "pytorch1"),
+            feature_names=ffs_cfg.get("feature_names", ["feat_04"]),
+        )
+        return provider, max_disp
+
+    waft_cfg = dict(disparity_cfg.get("waft") or {})
+    provider = WAFTStereoBackbone(
+        waft_root=waft_cfg["waft_root"],
+        config_path=waft_cfg["config_path"],
+        checkpoint_path=waft_cfg["checkpoint_path"],
+        freeze=freeze,
+        use_disparity=True,
+        feature_names=waft_cfg.get("feature_names", ["fmap1"]),
+        amp_dtype=waft_cfg.get("amp_dtype"),
+    )
+    return provider, max_disp
+
+
 def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
     backbone_cfg = cfg["backbone"]
     policy_cfg = cfg["policy"]
@@ -503,18 +545,18 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
                 "backbone.type='cnn-based' currently requires head.type='diffusion_unet'. "
                 f"Got head.type={head_type!r}."
             )
+        disparity_provider, disparity_max_disp = build_cnn_disparity_provider(backbone_cfg)
         return build_robomimic_diffusion_policy(
             backbone_cfg=backbone_cfg,
             policy_cfg=policy_cfg,
             head_cfg=head_cfg,
             image_size=cfg.get("dataset", {}).get("image_size", [224, 224]),
+            disparity_provider=disparity_provider,
+            disparity_max_disp=disparity_max_disp,
         )
 
-    if backbone_type != "ffs-based":
-        raise ValueError("backbone.type must be one of: cnn-based, ffs-based.")
-    if head_type == "diffusion_unet":
-        raise ValueError("head.type='diffusion_unet' is only supported with backbone.type='cnn-based'.")
-
+    if backbone_type not in {"ffs-based", "waft-based"}:
+        raise ValueError("backbone.type must be one of: cnn-based, ffs-based, waft-based.")
     dataset_cfg = cfg.get("dataset", {})
     action_head_cfg = resolve_action_head_cfg(head_cfg)
     num_stereo_pairs = len(dataset_cfg.get("camera_pairs", []))
@@ -524,18 +566,41 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
         isinstance(disparity_fusion_cfg, dict) and disparity_fusion_cfg.get("enabled", False)
     )
     use_disparity_tokens = bool(head_cfg.get("use_disparity_tokens", True))
-    backbone_use_disparity = policy_use_disparity and (use_disparity_tokens or disparity_fusion_enabled)
+    if head_type == "diffusion_unet":
+        backbone_use_disparity = bool(backbone_cfg.get("use_disparity", head_cfg.get("use_disparity", False)))
+    else:
+        backbone_use_disparity = policy_use_disparity and (use_disparity_tokens or disparity_fusion_enabled)
 
-    backbone = FoundationStereoBackbone(
-        foundation_root=backbone_cfg["foundation_root"],
-        checkpoint_path=backbone_cfg["checkpoint_path"],
-        valid_iters=backbone_cfg.get("valid_iters", 4),
-        max_disp=backbone_cfg.get("max_disp", 192),
-        freeze=backbone_cfg.get("freeze", True),
-        use_disparity=backbone_use_disparity,
-        optimize_build_volume=backbone_cfg.get("optimize_build_volume", "pytorch1"),
-        feature_names=backbone_cfg["feature_names"],
-    )
+    if backbone_type == "ffs-based":
+        backbone = FoundationStereoBackbone(
+            foundation_root=backbone_cfg["foundation_root"],
+            checkpoint_path=backbone_cfg["checkpoint_path"],
+            valid_iters=backbone_cfg.get("valid_iters", 4),
+            max_disp=backbone_cfg.get("max_disp", 192),
+            freeze=backbone_cfg.get("freeze", True),
+            use_disparity=backbone_use_disparity,
+            optimize_build_volume=backbone_cfg.get("optimize_build_volume", "pytorch1"),
+            feature_names=backbone_cfg["feature_names"],
+        )
+    else:
+        backbone = WAFTStereoBackbone(
+            waft_root=backbone_cfg["waft_root"],
+            config_path=backbone_cfg["config_path"],
+            checkpoint_path=backbone_cfg["checkpoint_path"],
+            freeze=backbone_cfg.get("freeze", True),
+            use_disparity=backbone_use_disparity,
+            feature_names=backbone_cfg["feature_names"],
+            amp_dtype=backbone_cfg.get("amp_dtype"),
+        )
+    max_disp = int(backbone_cfg.get("max_disp", getattr(backbone, "max_disp", 192)))
+
+    if head_type == "diffusion_unet":
+        return build_spatial_backbone_diffusion_policy(
+            backbone=backbone,
+            policy_cfg=policy_cfg,
+            head_cfg=head_cfg,
+            num_stereo_pairs=num_stereo_pairs,
+        )
 
     return StereoActionPolicy(
         backbone=backbone,
@@ -552,6 +617,6 @@ def build_policy(cfg: dict[str, Any]) -> StereoActionPolicy:
         spatial_query_num_heads=head_cfg.get("spatial_query_num_heads", 8),
         disparity_fusion_cfg=disparity_fusion_cfg,
         use_disparity_tokens=use_disparity_tokens,
-        max_disp=backbone_cfg.get("max_disp", 192),
+        max_disp=max_disp,
         action_head_cfg=action_head_cfg,
     )

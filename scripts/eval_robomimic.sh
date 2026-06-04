@@ -4,7 +4,7 @@ set -e
 ROOT_DIR=${ROOT_DIR:-/data/jsy/ffs}
 CONFIG=${CONFIG:-configs/robomimic_square_eval.yaml}
 CLIENT_PYTHON=${CLIENT_PYTHON:-python3}
-SAVE_ROOT=${SAVE_ROOT:-outputs/robomimic_square_diffusion_eval}
+SAVE_ROOT=${SAVE_ROOT:-eval_res/robomimic_square_diffusion_eval}
 DATASET=${DATASET:-/data/jsy/robomimic/datasets/square/ph/stereo_image_v15.hdf5}
 CKPT=${CKPT:-outputs/robomimic_square_diffusion_aligned/latest.pt}
 FFS_CONFIG_PATH=${FFS_CONFIG_PATH:-}

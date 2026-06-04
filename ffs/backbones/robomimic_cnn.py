@@ -16,7 +16,11 @@ OBS_KEY_MODALITIES = {
     "robot0_gripper_qpos": "low_dim",
     "object": "low_dim",
     "agentview_image": "rgb",
+    "agentview_right_image": "rgb",
+    "agentview_disp": "rgb",
     "robot0_eye_in_hand_image": "rgb",
+    "robot0_eye_in_hand_right_image": "rgb",
+    "robot0_eye_in_hand_disp": "rgb",
 }
 
 
@@ -383,6 +387,7 @@ class RobomimicCNNBackbone(nn.Module):
         observation_horizon: int = 2,
         image_size: list[int] | tuple[int, int] = (224, 224),
         use_left_only: bool = True,
+        use_disparity: bool = False,
         rgb_cfg: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
@@ -392,24 +397,29 @@ class RobomimicCNNBackbone(nn.Module):
         self.observation_horizon = observation_horizon
         self.image_size = tuple(image_size)
         self.use_left_only = bool(use_left_only)
-        if not self.use_left_only:
-            raise NotImplementedError("RobomimicCNNBackbone currently supports use_left_only=true only.")
+        self.use_disparity = bool(use_disparity)
 
         height, width = self.image_size
+        obs_shapes = OrderedDict(
+            [
+                ("agentview_image", (3, height, width)),
+                *([("agentview_disp", (1, height, width))] if self.use_disparity else []),
+                ("object", (14,)),
+                ("robot0_eef_pos", (3,)),
+                ("robot0_eef_quat", (4,)),
+                ("robot0_eye_in_hand_image", (3, height, width)),
+                *([("robot0_eye_in_hand_disp", (1, height, width))] if self.use_disparity else []),
+                ("robot0_gripper_qpos", (2,)),
+            ]
+        )
+        if not self.use_left_only:
+            obs_shapes["agentview_right_image"] = (3, height, width)
+            obs_shapes["robot0_eye_in_hand_right_image"] = (3, height, width)
         observation_group_shapes = OrderedDict(
             [
                 (
                     "obs",
-                    OrderedDict(
-                        [
-                            ("agentview_image", (3, height, width)),
-                            ("object", (14,)),
-                            ("robot0_eef_pos", (3,)),
-                            ("robot0_eef_quat", (4,)),
-                            ("robot0_eye_in_hand_image", (3, height, width)),
-                            ("robot0_gripper_qpos", (2,)),
-                        ]
-                    ),
+                    obs_shapes,
                 )
             ]
         )
@@ -433,17 +443,49 @@ class RobomimicCNNBackbone(nn.Module):
             "object": state[..., 9:23],
         }
 
-    def make_obs_dict(self, left: torch.Tensor, right: torch.Tensor, state: torch.Tensor) -> dict[str, torch.Tensor]:
-        del right
+    def make_obs_dict(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        state: torch.Tensor,
+        disparity: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         if left.shape[2] < 2:
             raise ValueError("RobomimicCNNBackbone expects two stereo camera pairs.")
+        if not self.use_left_only and right.shape[2] < 2:
+            raise ValueError("RobomimicCNNBackbone expects two right-camera views when use_left_only=false.")
+        if self.use_disparity:
+            if disparity is None:
+                raise ValueError("RobomimicCNNBackbone requires disparity when use_disparity=true.")
+            if disparity.ndim != 6 or disparity.shape[2] < 2 or disparity.shape[3] != 1:
+                raise ValueError(
+                    "RobomimicCNNBackbone expects disparity shape [B,T,V,1,H,W] "
+                    f"with at least two views, got {tuple(disparity.shape)}."
+                )
+            if disparity.shape[:2] != left.shape[:2]:
+                raise ValueError(
+                    "Disparity batch/time dimensions must match left images: "
+                    f"disparity={tuple(disparity.shape[:2])} left={tuple(left.shape[:2])}."
+                )
         obs = self.split_state(state)
         obs["agentview_image"] = (left[:, :, 0].float() / 255.0).clamp(0.0, 1.0)
         obs["robot0_eye_in_hand_image"] = (left[:, :, 1].float() / 255.0).clamp(0.0, 1.0)
+        if self.use_disparity:
+            obs["agentview_disp"] = disparity[:, :, 0].float().clamp(0.0, 1.0)
+            obs["robot0_eye_in_hand_disp"] = disparity[:, :, 1].float().clamp(0.0, 1.0)
+        if not self.use_left_only:
+            obs["agentview_right_image"] = (right[:, :, 0].float() / 255.0).clamp(0.0, 1.0)
+            obs["robot0_eye_in_hand_right_image"] = (right[:, :, 1].float() / 255.0).clamp(0.0, 1.0)
         return obs
 
-    def forward(self, left: torch.Tensor, right: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        obs = self.make_obs_dict(left, right, state)
+    def forward(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        state: torch.Tensor,
+        disparity: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        obs = self.make_obs_dict(left, right, state, disparity)
         batch, time = state.shape[:2]
         if time != self.observation_horizon:
             raise ValueError(

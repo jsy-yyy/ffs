@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,18 +36,49 @@ class EpisodeResult:
 
 
 class RobomimicPolicyClient:
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        expected_checkpoint: str | Path | None = None,
+        strict_checkpoint_match: bool = False,
+    ) -> None:
         self.host = host
         self.port = int(port)
+        self.expected_checkpoint = str(Path(expected_checkpoint).resolve(strict=False)) if expected_checkpoint else None
+        self.strict_checkpoint_match = bool(strict_checkpoint_match)
         self.sock: socket.socket | None = None
+        self.server_metadata: dict[str, Any] = {}
 
     def setup(self, seed: int | None = None) -> None:
         self.sock = socket.create_connection((self.host, self.port))
         send_msg(self.sock, {"cmd": "ping"})
-        self._recv_ok()
+        ret = self._recv_ok()
+        self.server_metadata = dict(ret.get("server", {}))
+        self._validate_server_checkpoint()
         if seed is not None:
             send_msg(self._socket(), {"cmd": "set_seed", "seed": int(seed)})
             self._recv_ok()
+
+    def _validate_server_checkpoint(self) -> None:
+        if not self.strict_checkpoint_match:
+            return
+        if not self.expected_checkpoint:
+            return
+        server_checkpoint = self.server_metadata.get("checkpoint")
+        if not server_checkpoint:
+            raise RuntimeError(
+                "Connected robomimic server did not report checkpoint metadata. "
+                "Restart the server with the current ffs.evaluation.robomimic.server code."
+            )
+        server_checkpoint = str(Path(server_checkpoint).resolve(strict=False))
+        if server_checkpoint != self.expected_checkpoint:
+            raise RuntimeError(
+                "Connected robomimic server is using a different checkpoint than the eval client.\n"
+                f"  server checkpoint: {server_checkpoint}\n"
+                f"  client checkpoint: {self.expected_checkpoint}\n"
+                "Restart the server or pass the same CKPT to scripts/eval_robomimic.sh."
+            )
 
     def reset(self, task_name: str, seed: int, episode_id: int) -> None:
         send_msg(
@@ -98,7 +131,12 @@ def select_action_steps(actions: np.ndarray, execute_chunk_steps: int | None) ->
 class RobomimicEvaluator:
     def __init__(self, config: EvalConfig, policy: RobomimicPolicyClient | None = None) -> None:
         self.config = config
-        self.policy = policy or RobomimicPolicyClient(config.policy.host, config.policy.port)
+        self.policy = policy or RobomimicPolicyClient(
+            config.policy.host,
+            config.policy.port,
+            expected_checkpoint=config.policy.checkpoint,
+            strict_checkpoint_match=config.policy.strict_checkpoint_match,
+        )
         self.ffs_cfg = load_ffs_sidecar_config(config.policy.checkpoint, config.policy.config_path)
         self.camera_pairs = self.ffs_cfg["dataset"]["camera_pairs"]
         self.camera_names = camera_names_from_pairs(self.camera_pairs)
@@ -135,22 +173,44 @@ class RobomimicEvaluator:
             },
         }
 
+    def _apply_server_metadata(self) -> None:
+        metadata = self.policy.server_metadata
+        if not metadata:
+            raise RuntimeError("robomimic server did not provide metadata on ping.")
+
+        camera_pairs = metadata.get("camera_pairs")
+        if not camera_pairs:
+            raise RuntimeError("robomimic server metadata is missing camera_pairs.")
+        self.camera_pairs = camera_pairs
+        self.camera_names = camera_names_from_pairs(self.camera_pairs)
+
+        if metadata.get("state_dim") is not None:
+            self.state_dim = int(metadata["state_dim"])
+        if metadata.get("action_dim") is not None:
+            self.action_dim = int(metadata["action_dim"])
+        if metadata.get("image_size") is not None:
+            self.image_size = tuple(int(value) for value in metadata["image_size"])
+            self.camera_height = int(self.config.env.camera_height or self.image_size[0])
+            self.camera_width = int(self.config.env.camera_width or self.image_size[1])
+
     def run(self) -> dict[str, float]:
         apply_runtime_env(
             numba_disable_jit=self.config.env.numba_disable_jit,
             mujoco_gl=self.config.env.mujoco_gl,
         )
-        env = make_robosuite_env(
-            self.env_meta,
-            camera_names=self.camera_names,
-            camera_height=self.camera_height,
-            camera_width=self.camera_width,
-            render_gpu_device_id=self.config.env.render_gpu_device_id,
-        )
         np.random.seed(int(self.config.env.seed))
         self.policy.setup(seed=int(self.config.env.seed))
+        self._apply_server_metadata()
+        env = None
         results: list[EpisodeResult] = []
         try:
+            env = make_robosuite_env(
+                self.env_meta,
+                camera_names=self.camera_names,
+                camera_height=self.camera_height,
+                camera_width=self.camera_width,
+                render_gpu_device_id=self.config.env.render_gpu_device_id,
+            )
             for episode_id in range(int(self.config.env.n_rollouts)):
                 try:
                     result = self.run_episode(env, episode_id)
@@ -180,7 +240,7 @@ class RobomimicEvaluator:
             return metrics
         finally:
             self.policy.close()
-            if hasattr(env, "close"):
+            if env is not None and hasattr(env, "close"):
                 env.close()
 
     def run_episode(self, env, episode_id: int) -> EpisodeResult:
@@ -290,7 +350,16 @@ class RobomimicEvaluator:
     def _write_video(self, episode_id: int, seed: int, frames: list[np.ndarray], success: bool) -> None:
         path = self._root() / "visualization" / self.task_name / f"seed_{seed}_episode_{episode_id}_{success}.mp4"
         path.parent.mkdir(parents=True, exist_ok=True)
-        imageio.mimsave(path, frames, fps=20)
+        _ensure_imageio_ffmpeg_exe()
+        try:
+            imageio.mimsave(path, frames, fps=20)
+        except TypeError as exc:
+            if "expected str, bytes or os.PathLike object, not NoneType" not in str(exc):
+                raise
+            raise RuntimeError(
+                "Failed to save robomimic rollout video because imageio-ffmpeg could not resolve "
+                "an ffmpeg executable. Install ffmpeg or set IMAGEIO_FFMPEG_EXE to a valid ffmpeg path."
+            ) from exc
 
     def _summarize(self, results: list[EpisodeResult]) -> dict[str, float]:
         if not results:
@@ -318,6 +387,14 @@ def video_frame_from_payload(obs: dict[str, Any], camera_pairs: list[list[str]])
         frames.append(np.asarray(images[payload_image_name(left_key)], dtype=np.uint8))
         frames.append(np.asarray(images[payload_image_name(right_key)], dtype=np.uint8))
     return np.concatenate(frames, axis=1)
+
+
+def _ensure_imageio_ffmpeg_exe() -> None:
+    if os.environ.get("IMAGEIO_FFMPEG_EXE"):
+        return
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if ffmpeg_exe:
+        os.environ["IMAGEIO_FFMPEG_EXE"] = ffmpeg_exe
 
 
 def _load_checkpoint_env_meta(checkpoint: str | Path) -> dict[str, Any] | None:

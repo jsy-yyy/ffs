@@ -16,6 +16,7 @@ class PolicyConfig:
     ffs_root: str = "/data/jsy/ffs"
     checkpoint: str = "outputs/robomimic_square_diffusion_aligned/latest.pt"
     config_path: str | None = None
+    strict_checkpoint_match: bool = False
     device: str = "cuda:0"
     amp: bool = True
     use_ema: bool = True
@@ -56,7 +57,7 @@ class RecordConfig:
 
 @dataclass
 class EvalConfig:
-    save_root: str = "outputs/robomimic_square_eval"
+    save_root: str = "eval_res/robomimic_square_eval"
     dry_run: bool = False
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     env: EnvConfig = field(default_factory=EnvConfig)

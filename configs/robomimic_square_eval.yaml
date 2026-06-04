@@ -1,4 +1,4 @@
-save_root: outputs/robomimic_square_diffusion_eval
+save_root: eval_res/robomimic_square_diffusion_eval
 dry_run: false
 
 policy:

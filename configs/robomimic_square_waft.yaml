@@ -1,31 +1,13 @@
 backbone:
-  type: cnn-based
-  image_size: [224, 224]
-  use_left_only: false
-  disparity:
-    enabled: true
-    source: waft
-    max_disp: 192
-    freeze: true
-    ffs:
-      foundation_root: /data/jsy/Fast-FoundationStereo
-      checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
-      valid_iters: 4
-      optimize_build_volume: pytorch1
-    waft:
-      waft_root: /data/jsy/WAFT-Stereo
-      config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
-      checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
-      amp_dtype: bfloat16
-  rgb:
-    noise_std: 0.01
-    feature_dimension: 64
-    backbone_class: ResNet18Conv
-    pool_class: SpatialSoftmax
-    num_kp: 32
-    crop_height: 216
-    crop_width: 216
-    replace_bn_with_gn: true
+  type: waft-based
+  waft_root: /data/jsy/WAFT-Stereo
+  config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
+  checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
+  feature_names: [fmap1, net, disp]
+  freeze: true
+  use_disparity: true
+  amp_dtype: bfloat16
+  max_disp: 800
 
 dataset:
   type: robomimic-stereo-lerobot
@@ -49,11 +31,15 @@ policy:
   prediction_horizon: 16
   action_dim: 7
   state_dim: 23
+  use_disparity: true
   disparity_ablation: none
 
 head:
   type: diffusion_unet
   diffusion_unet:
+    spatial_softmax:
+      num_kp: 32
+      temperature: 1.0
     diffusion_step_embed_dim: 256
     down_dims: [256, 512, 1024]
     kernel_size: 5
@@ -66,21 +52,21 @@ head:
       prediction_type: epsilon
 
 train:
-  output_dir: outputs/native_dp_with_waft_disparity_noise_tmp
+  output_dir: outputs/robomimic_square_waft_wdisp_s
   epochs: 5000
   epoch_every_n_steps: 100
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   lr: 1e-4
   weight_decay: 1.0e-6
   scheduler_type: cosine
   warmup_steps: 500
   num_cycles: 0.5
-  amp: false
+  amp: true
   suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 5000
-  resume_from: 
+  resume_from: outputs/robomimic_square_waft_wdisp_s/latest.pt
   ema:
     enabled: true
     power: 0.75

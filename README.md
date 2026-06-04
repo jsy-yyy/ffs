@@ -82,7 +82,9 @@ The model architecture is selected by `backbone.type` and `head.type`.
   supports `head.type: mlp` or `head.type: rdt`.
 - `backbone.type: cnn-based` uses the local robomimic-style CNN observation encoder
   (`VisualCore` with `ResNet18Conv` and `SpatialSoftmax`) and supports
-  `head.type: diffusion_unet`.
+  `head.type: diffusion_unet`. It can optionally keep RGB observations
+  left-only while adding disparity maps from FFS or WAFT as separate 1-channel
+  CNN observation branches.
 
 Available FFS action heads are:
 
@@ -117,6 +119,10 @@ backbone:
   type: cnn-based
   image_size: [224, 224]
   use_left_only: true
+  disparity:
+    enabled: true
+    source: ffs
+    max_disp: 192
 
 head:
   type: diffusion_unet
@@ -260,7 +266,7 @@ The default square-task config is `configs/robomimic_square_eval.yaml`. It uses:
 ```text
 checkpoint: outputs/robomimic_square_rdt/latest.pt
 dataset:    /data/jsy/robomimic/datasets/square/ph/stereo_image_v15.hdf5
-save root:  outputs/robomimic_square_eval
+save root:  eval_res/robomimic_square_diffusion_eval
 port:       29068
 ```
 
@@ -276,7 +282,7 @@ Then run the environment client in another terminal:
 
 ```bash
 cd /data/jsy/ffs
-PORT=29068 TEST_NUM=20 HORIZON=400 SEED=0 \
+CKPT=outputs/robomimic_square_rdt/latest.pt PORT=29068 TEST_NUM=20 HORIZON=400 SEED=0 \
   bash scripts/eval_robomimic.sh
 ```
 
@@ -310,7 +316,7 @@ Useful overrides:
 The client writes results under:
 
 ```text
-outputs/robomimic_square_eval/stseed-{SEED}/
+eval_res/robomimic_square_diffusion_eval/stseed-{SEED}/
 ```
 
 Important files are:

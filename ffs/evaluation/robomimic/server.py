@@ -46,6 +46,7 @@ class RobomimicFFSService:
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested for robomimic eval server, but it is unavailable.")
 
+        self.checkpoint = str(Path(checkpoint).resolve(strict=False))
         self.cfg, self.config_source = load_config_for_checkpoint(checkpoint, config_path)
         self.cfg.setdefault("policy", {})["disparity_ablation"] = disparity_ablation
         self.camera_pairs = self.cfg["dataset"]["camera_pairs"]
@@ -87,6 +88,19 @@ class RobomimicFFSService:
             )
         elif clip_sample is not None and hasattr(self.model, "noise_scheduler"):
             self.model.noise_scheduler.clip_sample = bool(clip_sample)
+
+    def metadata(self) -> dict[str, Any]:
+        backbone_cfg = self.cfg.get("backbone", {})
+        return {
+            "checkpoint": self.checkpoint,
+            "config_source": self.config_source,
+            "weights": self.weights_source,
+            "backbone_type": backbone_cfg.get("type"),
+            "camera_pairs": self.camera_pairs,
+            "image_size": list(self.image_size) if self.image_size is not None else None,
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+        }
 
     def set_seed(self, seed: int) -> None:
         seed = int(seed)
@@ -405,7 +419,9 @@ def main() -> None:
                             service.set_seed(req["seed"])
                             send_msg(conn, {"ok": True})
                         elif cmd == "ping":
-                            send_msg(conn, {"ok": True})
+                            send_msg(conn, {"ok": True, "server": service.metadata()})
+                        elif cmd == "info":
+                            send_msg(conn, {"ok": True, "server": service.metadata()})
                         else:
                             send_msg(conn, {"error": f"unknown cmd: {cmd}"})
                     except Exception:
