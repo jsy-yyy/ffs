@@ -76,15 +76,25 @@ dataset:
 
 ## Policy architecture
 
-The model architecture is selected by `backbone.type` and `head.type`.
+The model architecture is selected by `backbone.type`, `adapter.type`, and
+`head.type`.
 
 - `backbone.type: ffs-based` uses the FoundationStereo feature backbone and
   supports `head.type: mlp` or `head.type: rdt`.
 - `backbone.type: cnn-based` uses the local robomimic-style CNN observation encoder
-  (`VisualCore` with `ResNet18Conv` and `SpatialSoftmax`) and supports
-  `head.type: diffusion_unet`. It can optionally keep RGB observations
+  (`ResNet18Conv` feature maps) and supports `head.type: diffusion_unet` through
+  `adapter.type: spatial_softmax`. It can optionally keep RGB observations
   left-only while adding disparity maps from FFS or WAFT as separate 1-channel
   CNN observation branches.
+- `adapter.type: spatial_softmax` pools map features into a diffusion condition
+  vector. It is shared by WAFT/FFS/CNN map backbones.
+- `adapter.type: spatial_query` reads state-conditioned tokens from spatial maps
+  for `mlp` or `rdt` heads.
+- `adapter.type: vector` flattens vector-like backbone features for diffusion.
+- `adapter.type: reshape_tokens` is a parameter-free reshape adapter. It turns
+  same-channel backbone features into `[B, N, C]` condition tokens for `mlp` or
+  `rdt`; set `flatten: true` to flatten those tokens into a diffusion condition
+  vector.
 
 Available FFS action heads are:
 
@@ -99,12 +109,15 @@ backbone:
   type: ffs-based
   feature_names: [feat_04, feat_08, feat_16, feat_32]
 
-head:
-  type: rdt
-  condition_token_dim: 256
+adapter:
+  type: spatial_query
+  token_dim: 256
   feature_queries_per_scale: 4
   disp_queries: 8
-  spatial_query_num_heads: 8
+  num_heads: 8
+
+head:
+  type: rdt
   rdt:
     hidden_size: 256
     depth: 4
@@ -119,10 +132,21 @@ backbone:
   type: cnn-based
   image_size: [224, 224]
   use_left_only: true
+  use_disparity: true
   disparity:
     enabled: true
     source: ffs
     max_disp: 192
+  rgb_encoder:
+    backbone_class: ResNet18Conv
+    crop_height: 216
+    crop_width: 216
+
+adapter:
+  type: spatial_softmax
+  num_kp: 32
+  temperature: 1.0
+  projection_dim: 64
 
 head:
   type: diffusion_unet
@@ -282,8 +306,7 @@ Then run the environment client in another terminal:
 
 ```bash
 cd /data/jsy/ffs
-CKPT=outputs/robomimic_square_rdt/latest.pt PORT=29068 TEST_NUM=20 HORIZON=400 SEED=0 \
-  bash scripts/eval_robomimic.sh
+CKPT=outputs/robomimic_square_rdt/latest.pt PORT=29068 TEST_NUM=50 HORIZON=400 SEED=0 bash scripts/eval_robomimic.sh
 ```
 
 For a quick configuration check without starting rollouts or connecting to the

@@ -32,10 +32,12 @@ policy:
   state_dim: 23
 
 adapter:
-  type: spatial_softmax
+  type: spatial_query
   feature_names: auto
-  num_kp: 32
-  temperature: 1.0
+  token_dim: 256
+  queries_per_feature: 2
+  num_heads: 8
+  flatten: true
 
 head:
   type: diffusion_unet
@@ -52,7 +54,7 @@ head:
       prediction_type: epsilon
 
 train:
-  output_dir: outputs/waft_dp_net
+  output_dir: outputs/waft_dp_refinenet_all
   epochs: 5000
   epoch_every_n_steps: 100
   batch_size: 16

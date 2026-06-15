@@ -1,15 +1,15 @@
 from .config import load_config, load_config_for_checkpoint
-from .backbones import RobomimicCNNBackbone, WAFTStereoBackbone
+from .backbones import DinoDenseFeatureBranch, RobomimicCNNBackbone, StereoTransformerBackbone, WAFTStereoBackbone
 from .heads import DiffusionUNetActionHead
-from .policies.robomimic_diffusion_policy import RobomimicDiffusionPolicy
-from .policies.stereo_action_policy import StereoActionPolicy
+from .policies.backbone_adapter_head import BackboneAdapterHeadPolicy
 
 __all__ = [
-    "RobomimicDiffusionPolicy",
+    "BackboneAdapterHeadPolicy",
+    "DinoDenseFeatureBranch",
     "RobomimicCNNBackbone",
+    "StereoTransformerBackbone",
     "WAFTStereoBackbone",
     "DiffusionUNetActionHead",
-    "StereoActionPolicy",
     "load_config",
     "load_config_for_checkpoint",
 ]

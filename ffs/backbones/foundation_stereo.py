@@ -16,8 +16,9 @@ class FoundationStereoBackbone(nn.Module):
     Inputs are RGB tensors in 0..255 range with shape [N, 3, H, W].
     """
 
-    all_feature_names = ("feat_04", "feat_08", "feat_16", "feat_32")
-    feature_names = all_feature_names
+    visual_feature_names = ("feat_04", "feat_08", "feat_16", "feat_32")
+    all_feature_names = (*visual_feature_names, "disp")
+    feature_names = visual_feature_names
 
     def __init__(
         self,
@@ -36,9 +37,9 @@ class FoundationStereoBackbone(nn.Module):
         self.valid_iters = valid_iters
         self.max_disp = max_disp
         self.freeze = freeze
-        self.use_disparity = use_disparity
         self.optimize_build_volume = optimize_build_volume
         self.feature_names = self._validate_feature_names(feature_names)
+        self.use_disparity = "disp" in self.feature_names
 
         self._add_foundation_root()
         self._patch_timm_layers_alias()
@@ -51,12 +52,13 @@ class FoundationStereoBackbone(nn.Module):
             self.model.requires_grad_(False)
             self.model.eval()
 
-        self.feature_channels = dict(zip(self.all_feature_names, self.model.feature.d_out))
+        self.feature_channels = dict(zip(self.visual_feature_names, self.model.feature.d_out))
+        self.feature_channels["disp"] = 1
         self.visual_token_dim = sum(self.feature_channels[name] for name in self.feature_names)
 
     def _validate_feature_names(self, feature_names: Sequence[str] | None) -> tuple[str, ...]:
         if feature_names is None:
-            return self.all_feature_names
+            return self.visual_feature_names
         selected = tuple(feature_names)
         if not selected:
             raise ValueError("backbone.feature_names must be a non-empty list.")
@@ -92,8 +94,8 @@ class FoundationStereoBackbone(nn.Module):
         left = normalize_image(left)
         right = normalize_image(right)
         features = self.model.feature(torch.cat([left, right], dim=0))
-        all_features = {name: feat[:b] for name, feat in zip(self.all_feature_names, features)}
-        return {name: all_features[name] for name in self.feature_names}
+        all_features = {name: feat[:b] for name, feat in zip(self.visual_feature_names, features)}
+        return {name: all_features[name] for name in self.feature_names if name != "disp"}
 
     def forward(self, left: torch.Tensor, right: torch.Tensor) -> dict[str, torch.Tensor]:
         if self.freeze:

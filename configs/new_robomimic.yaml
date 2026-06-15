@@ -2,7 +2,7 @@ backbone:
   type: ffs-based
   foundation_root: /data/jsy/Fast-FoundationStereo
   checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
-  feature_names: [feat_04, feat_32]
+  feature_names: [feat_04, feat_32, disp]
   freeze: true
   valid_iters: 4
   max_disp: 192
@@ -30,23 +30,16 @@ policy:
   prediction_horizon: 16
   action_dim: 7
   state_dim: 23
-  use_disparity: true
-  disparity_ablation: none
+
+adapter:
+  type: spatial_query
+  feature_names: auto
+  token_dim: 256
+  queries_per_feature: 2
+  num_heads: 8
 
 head:
   type: rdt
-  condition_token_dim: 256
-  feature_queries_per_scale: 2
-  disp_queries: 4
-  spatial_query_num_heads: 8
-  use_disparity_tokens: true
-  disparity_fusion:
-    enabled: false
-    feature_names: [feat_04, feat_32]
-    input_mode: disp_xy
-    hidden_channels: 16
-    output_channels: 16
-    num_layers: 2
   mlp:
     hidden_dim: 512
     num_blocks: 10
@@ -66,7 +59,7 @@ head:
     clip_sample: false
     act_adaptor: mlp3x_silu
     state_adaptor: mlp3x_silu
-    img_adaptor: linear
+    vision_adaptor: linear
     dtype: float32
 
 train:
@@ -84,7 +77,7 @@ train:
   suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 5000
-  resume_from: 
+  resume_from:
   ema:
     enabled: true
     power: 0.75

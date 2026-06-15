@@ -25,7 +25,7 @@ from ffs.argparse_compat import add_boolean_optional_argument
 from ffs import load_config_for_checkpoint
 from ffs.datasets import build_stereo_lerobot_dataset
 from ffs.datasets.lerobot import relative_action_to_absolute_eef_pose
-from ffs.policies.stereo_action_policy import build_policy
+from ffs.policies.builder import build_policy
 from ffs.visualization import (
     default_query_attention_config,
     render_query_attention_frames,

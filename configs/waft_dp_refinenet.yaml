@@ -52,7 +52,7 @@ head:
       prediction_type: epsilon
 
 train:
-  output_dir: outputs/waft_dp_net
+  output_dir: outputs/waft_dp_refinenet
   epochs: 5000
   epoch_every_n_steps: 100
   batch_size: 16

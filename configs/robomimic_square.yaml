@@ -2,6 +2,7 @@ backbone:
   type: cnn-based
   image_size: [224, 224]
   use_left_only: false
+  use_disparity: true
   disparity:
     enabled: true
     source: waft
@@ -17,12 +18,8 @@ backbone:
       config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
       checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
       amp_dtype: bfloat16
-  rgb:
-    noise_std: 0.01
-    feature_dimension: 64
+  rgb_encoder:
     backbone_class: ResNet18Conv
-    pool_class: SpatialSoftmax
-    num_kp: 32
     crop_height: 216
     crop_width: 216
     replace_bn_with_gn: true
@@ -50,6 +47,14 @@ policy:
   action_dim: 7
   state_dim: 23
   disparity_ablation: none
+
+adapter:
+  type: spatial_softmax
+  feature_names: auto
+  num_kp: 32
+  temperature: 1.0
+  noise_std: 0.01
+  projection_dim: 64
 
 head:
   type: diffusion_unet

@@ -53,3 +53,5 @@ tests/
 tmp
 vis*
 eval_res/
+
+*.png

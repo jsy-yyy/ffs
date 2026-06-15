@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ffs import load_config
 from ffs.datasets import build_stereo_lerobot_dataset
 from ffs.ema import ModelEMA, ema_config_from_train_cfg
-from ffs.policies.stereo_action_policy import build_policy
+from ffs.policies.builder import build_policy
 
 
 def is_dist() -> bool:

@@ -40,7 +40,7 @@ class RobomimicFFSService:
         from ffs import load_config_for_checkpoint
         from ffs.datasets import ActionNormalizer
         from ffs.ema import load_ema_state_dict
-        from ffs.policies.stereo_action_policy import build_policy
+        from ffs.policies.builder import build_policy
 
         self.device = torch.device(device)
         if self.device.type == "cuda" and not torch.cuda.is_available():

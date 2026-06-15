@@ -3,10 +3,17 @@ backbone:
   waft_root: /data/jsy/WAFT-Stereo
   config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
   checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
-  feature_names: [refine_net]
+  feature_names: [refine_net, dino]
   freeze: true
   amp_dtype: bfloat16
   max_disp: 800
+  dino:
+    view_indices: [0]
+    repo_or_dir: /home/zmz/.cache/torch/hub/facebookresearch_dinov2_main
+    source: local
+    torchhub_model: dinov2_vitb14_reg
+    checkpoint_path: /data/jsy/ffs/weights/dinov2_vitb14_reg4_pretrain.pth
+    freeze: true
 
 dataset:
   type: robomimic-stereo-lerobot
@@ -32,30 +39,33 @@ policy:
   state_dim: 23
 
 adapter:
-  type: spatial_softmax
+  type: reshape_tokens
   feature_names: auto
-  num_kp: 32
-  temperature: 1.0
+  flatten: false
 
 head:
-  type: diffusion_unet
-  diffusion_unet:
-    diffusion_step_embed_dim: 256
-    down_dims: [256, 512, 1024]
-    kernel_size: 5
-    n_groups: 8
-    ddpm:
-      num_train_timesteps: 100
-      num_inference_timesteps: 100
-      beta_schedule: squaredcos_cap_v2
-      clip_sample: true
-      prediction_type: epsilon
+  type: rdt
+  rdt:
+    hidden_size: 256
+    depth: 4
+    num_heads: 8
+    num_kv_heads: 8
+    norm_eps: 1.0e-5
+    multiple_of: 256
+    use_flash_attn: true
+    num_register_tokens: 4
+    num_inference_steps: 100
+    sample_init: randn
+    act_adaptor: mlp3x_silu
+    state_adaptor: mlp3x_silu
+    vision_adaptor: linear
+    dtype: float32
 
 train:
-  output_dir: outputs/waft_dp_net
+  output_dir: outputs/waft_dino_rdt
   epochs: 5000
   epoch_every_n_steps: 100
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   lr: 1e-4
   weight_decay: 1.0e-6
@@ -66,7 +76,7 @@ train:
   suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 5000
-  resume_from:
+  resume_from: 
   ema:
     enabled: true
     power: 0.75

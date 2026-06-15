@@ -1,12 +1,37 @@
 backbone:
-  type: waft-based
-  waft_root: /data/jsy/WAFT-Stereo
-  config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
-  checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
-  feature_names: [refine_net]
-  freeze: true
-  amp_dtype: bfloat16
-  max_disp: 800
+  type: cnn-based
+  image_size: [224, 224]
+  use_left_only: true
+  use_disparity: false
+  disparity:
+    enabled: true
+    source: waft
+    max_disp: 192
+    freeze: true
+    ffs:
+      foundation_root: /data/jsy/Fast-FoundationStereo
+      checkpoint_path: /data/jsy/Fast-FoundationStereo/weights/20-30-48/model_best_bp2_serialize.pth
+      valid_iters: 4
+      optimize_build_volume: pytorch1
+    waft:
+      waft_root: /data/jsy/WAFT-Stereo
+      config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
+      checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
+      amp_dtype: bfloat16
+  dino:
+    enabled: true
+    view_indices: [0, 1]
+    repo_or_dir: /home/zmz/.cache/torch/hub/facebookresearch_dinov2_main
+    source: local
+    torchhub_model: dinov2_vitb14_reg
+    checkpoint_path: /data/jsy/ffs/weights/dinov2_vitb14_reg4_pretrain.pth
+    output_channels: 128
+    freeze: true
+  rgb_encoder:
+    backbone_class: ResNet18Conv
+    crop_height: 216
+    crop_width: 216
+    replace_bn_with_gn: true
 
 dataset:
   type: robomimic-stereo-lerobot
@@ -30,12 +55,14 @@ policy:
   prediction_horizon: 16
   action_dim: 7
   state_dim: 23
+  disparity_ablation: none
 
 adapter:
   type: spatial_softmax
   feature_names: auto
   num_kp: 32
   temperature: 1.0
+  projection_dim: 64
 
 head:
   type: diffusion_unet
@@ -52,7 +79,7 @@ head:
       prediction_type: epsilon
 
 train:
-  output_dir: outputs/waft_dp_net
+  output_dir: outputs/native_dp_with_dino
   epochs: 5000
   epoch_every_n_steps: 100
   batch_size: 16
@@ -62,11 +89,11 @@ train:
   scheduler_type: cosine
   warmup_steps: 500
   num_cycles: 0.5
-  amp: true
+  amp: false
   suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 5000
-  resume_from:
+  resume_from: 
   ema:
     enabled: true
     power: 0.75

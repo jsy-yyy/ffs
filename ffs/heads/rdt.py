@@ -392,6 +392,7 @@ class RDTActionHead(ActionHead):
         input_dim: int,
         action_dim: int,
         action_horizon: int,
+        prediction_horizon: int | None = None,
         frame_token_dim: int | None = None,
         condition_len: int | None = None,
         num_history_frames: int | None = None,
@@ -410,7 +411,7 @@ class RDTActionHead(ActionHead):
         clip_sample: bool = False,
         act_adaptor: str = "mlp3x_silu",
         state_adaptor: str = "mlp3x_silu",
-        img_adaptor: str = "linear",
+        vision_adaptor: str = "linear",
         dtype: str | torch.dtype = torch.float32,
     ) -> None:
         super().__init__(input_dim=input_dim, action_dim=action_dim, action_horizon=action_horizon)
@@ -428,6 +429,9 @@ class RDTActionHead(ActionHead):
             raise ValueError("num_heads must be divisible by num_kv_heads.")
         if sample_init not in ("randn", "zeros"):
             raise ValueError("sample_init must be 'randn' or 'zeros'.")
+        self.prediction_horizon = int(prediction_horizon or action_horizon)
+        if self.prediction_horizon < action_horizon:
+            raise ValueError("prediction_horizon must be >= action_horizon.")
             
         self.frame_token_dim = frame_token_dim
         self.condition_len = condition_len
@@ -450,7 +454,7 @@ class RDTActionHead(ActionHead):
         self.t_embedder = TimestepEmbedder(hidden_size, dtype=self.param_dtype)
         self.act_adaptor = _build_adapter(act_adaptor, action_dim, hidden_size)
         self.state_adaptor = _build_adapter(state_adaptor, frame_token_dim, hidden_size)
-        self.img_adaptor = _build_adapter(img_adaptor, frame_token_dim, hidden_size)
+        self.vision_adaptor = _build_adapter(vision_adaptor, frame_token_dim, hidden_size)
         self.blocks = nn.ModuleList(
             [
                 RDTBlock(
@@ -476,17 +480,17 @@ class RDTActionHead(ActionHead):
                 hidden_size,
                 OrderedDict(
                     [
-                        ("action", action_horizon),
+                        ("action", self.prediction_horizon),
                         ("register", num_register_tokens),
                     ]
                 ),
             ).unsqueeze(0)
         )
-        max_img_len = max(condition_len - 1, 1)
-        self.img_pos_emb = nn.Parameter(
+        max_vision_len = max(condition_len - 1, 1)
+        self.vision_pos_emb = nn.Parameter(
             _multimodal_pos_embed(
                 hidden_size,
-                OrderedDict([("image", max_img_len)]),
+                OrderedDict([("vision", max_vision_len)]),
             ).unsqueeze(0)
         )
         self.state_pos_emb = nn.Parameter(
@@ -528,7 +532,7 @@ class RDTActionHead(ActionHead):
         )
 
     def _initial_sample(self, frame_tokens: torch.Tensor) -> torch.Tensor:
-        shape = (frame_tokens.shape[0], self.action_horizon, self.action_dim)
+        shape = (frame_tokens.shape[0], self.prediction_horizon, self.action_dim)
         if self.sample_init == "zeros":
             return torch.zeros(shape, device=frame_tokens.device, dtype=self.param_dtype)
         return torch.randn(shape, device=frame_tokens.device, dtype=self.param_dtype)
@@ -550,27 +554,27 @@ class RDTActionHead(ActionHead):
 
         cond_mask = torch.ones(tokens.shape[1], device=tokens.device, dtype=torch.bool)
         cond_mask[state_indices] = False
-        img_tokens = tokens[:, cond_mask, :]
-        if img_tokens.shape[1] == 0:
+        vision_tokens = tokens[:, cond_mask, :]
+        if vision_tokens.shape[1] == 0:
             raise ValueError("RDTActionHead needs at least one non-state condition token.")
 
-        img_cond = self.img_adaptor(img_tokens)
-        img_cond = img_cond + self.img_pos_emb[:, : img_cond.shape[1]]
+        vision_cond = self.vision_adaptor(vision_tokens)
+        vision_cond = vision_cond + self.vision_pos_emb[:, : vision_cond.shape[1]]
         state_cond = self.state_adaptor(state_token) + self.state_pos_emb
-        img_mask = torch.ones(
-            (tokens.shape[0], img_cond.shape[1]),
+        vision_mask = torch.ones(
+            (tokens.shape[0], vision_cond.shape[1]),
             device=tokens.device,
             dtype=torch.bool,
         )
-        return img_cond, state_cond, img_mask
+        return vision_cond, state_cond, vision_mask
 
     def _predict_velocity(
         self,
         noisy_action: torch.Tensor,
         timestep: torch.Tensor,
-        img_cond: torch.Tensor,
+        vision_cond: torch.Tensor,
         state_cond: torch.Tensor,
-        img_mask: torch.Tensor,
+        vision_mask: torch.Tensor,
     ) -> torch.Tensor:
         x = self.act_adaptor(noisy_action.to(self.param_dtype))
         t = self.t_embedder(timestep.to(device=noisy_action.device))
@@ -585,14 +589,19 @@ class RDTActionHead(ActionHead):
             x = block(
                 x=x,
                 t_state=t_state,
-                condition=img_cond,
-                condition_mask=img_mask,
+                condition=vision_cond,
+                condition_mask=vision_mask,
             )
         x = self.final_layer(x, t_state)
-        return x[:, : self.action_horizon]
+        return x[:, : self.prediction_horizon]
 
     def training_loss(self, frame_tokens: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        img_cond, state_cond, img_mask = self._prepare_conditions(frame_tokens)
+        if action.shape[1] != self.prediction_horizon:
+            raise ValueError(
+                f"RDTActionHead expected action prediction horizon {self.prediction_horizon}, "
+                f"got {action.shape[1]}."
+            )
+        vision_cond, state_cond, vision_mask = self._prepare_conditions(frame_tokens)
         action = action.to(self.param_dtype)
         noise = torch.randn_like(action)
         timesteps = self.timestep_sampler.sample((action.shape[0],))[:, 0].to(
@@ -603,14 +612,14 @@ class RDTActionHead(ActionHead):
         pred = self._predict_velocity(
             noisy_action=noisy_action,
             timestep=timesteps,
-            img_cond=img_cond,
+            vision_cond=vision_cond,
             state_cond=state_cond,
-            img_mask=img_mask,
+            vision_mask=vision_mask,
         )
         return F.mse_loss(pred, action - noise)
 
     def forward(self, frame_tokens: torch.Tensor) -> torch.Tensor:
-        img_cond, state_cond, img_mask = self._prepare_conditions(frame_tokens)
+        vision_cond, state_cond, vision_mask = self._prepare_conditions(frame_tokens)
         noisy_action = self._initial_sample(frame_tokens)
         timestep = torch.tensor([0.0], device=frame_tokens.device, dtype=self.param_dtype)
         step_size = 1.0 / self.num_inference_steps
@@ -619,13 +628,15 @@ class RDTActionHead(ActionHead):
             pred = self._predict_velocity(
                 noisy_action=noisy_action,
                 timestep=timestep,
-                img_cond=img_cond,
+                vision_cond=vision_cond,
                 state_cond=state_cond,
-                img_mask=img_mask,
+                vision_mask=vision_mask,
             )
             noisy_action = noisy_action + pred * step_size
             if self.clip_sample:
                 noisy_action = noisy_action.clamp(-1.0, 1.0)
             timestep = timestep + step_size
 
-        return noisy_action.to(frame_tokens.dtype)
+        start = (self.num_history_frames or 1) - 1
+        end = start + self.action_horizon
+        return noisy_action[:, start:end].to(frame_tokens.dtype)

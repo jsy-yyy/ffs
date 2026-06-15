@@ -1,12 +1,25 @@
 backbone:
-  type: waft-based
-  waft_root: /data/jsy/WAFT-Stereo
-  config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
-  checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
-  feature_names: [refine_net]
-  freeze: true
-  amp_dtype: bfloat16
-  max_disp: 800
+  type: stereo-transformer
+  feature_names: [stereo_latent]
+  cnn_feature_dim: 128
+  token_dim: 256
+  latent_dim: 128
+  num_layers: 2
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  pretrained_resnet: false
+  freeze_cnn: false
+  dino:
+    # Empty means no DINO branch. Set, for example, [0] to use DINO on the
+    # first stereo camera pair in dataset.camera_pairs.
+    view_indices: [0]
+    repo_or_dir: /home/zmz/.cache/torch/hub/facebookresearch_dinov2_main
+    source: local
+    # torchhub_model: dinov2_vitl14_reg
+    torchhub_model: dinov2_vitb14_reg
+    checkpoint_path: /data/jsy/ffs/weights/dinov2_vitb14_reg4_pretrain.pth
+    output_channels: 128
 
 dataset:
   type: robomimic-stereo-lerobot
@@ -32,10 +45,8 @@ policy:
   state_dim: 23
 
 adapter:
-  type: spatial_softmax
+  type: vector
   feature_names: auto
-  num_kp: 32
-  temperature: 1.0
 
 head:
   type: diffusion_unet
@@ -52,17 +63,17 @@ head:
       prediction_type: epsilon
 
 train:
-  output_dir: outputs/waft_dp_net
-  epochs: 5000
-  epoch_every_n_steps: 100
-  batch_size: 16
+  output_dir: outputs/stereo_transformer_dp
+  epochs: 500
+  epoch_every_n_steps: 800
+  batch_size: 1
   num_workers: 4
   lr: 1e-4
   weight_decay: 1.0e-6
   scheduler_type: cosine
   warmup_steps: 500
   num_cycles: 0.5
-  amp: true
+  amp: false
   suppress_dynamo_errors: true
   log_interval: 50
   save_ckpt_interval: 5000

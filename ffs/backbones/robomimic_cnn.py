@@ -6,8 +6,9 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torchvision import models as vision_models
+
+from .dino import DinoDenseFeatureBranch
 
 
 OBS_KEY_MODALITIES = {
@@ -18,14 +19,12 @@ OBS_KEY_MODALITIES = {
     "agentview_image": "rgb",
     "agentview_right_image": "rgb",
     "agentview_disp": "rgb",
+    "agentview_dino": "rgb",
     "robot0_eye_in_hand_image": "rgb",
     "robot0_eye_in_hand_right_image": "rgb",
     "robot0_eye_in_hand_disp": "rgb",
+    "robot0_eye_in_hand_dino": "rgb",
 }
-
-
-def _flatten_batch(x: torch.Tensor) -> torch.Tensor:
-    return x.reshape(x.shape[0], -1)
 
 
 def _center_crop_chw(inputs: torch.Tensor, crop_height: int, crop_width: int) -> torch.Tensor:
@@ -102,130 +101,6 @@ class ResNet18Conv(nn.Module):
         return self.nets(inputs)
 
 
-class SpatialSoftmax(nn.Module):
-    def __init__(
-        self,
-        input_shape: tuple[int, int, int],
-        num_kp: int | None = 32,
-        temperature: float = 1.0,
-        learnable_temperature: bool = False,
-        output_variance: bool = False,
-        noise_std: float = 0.0,
-    ) -> None:
-        super().__init__()
-        if len(input_shape) != 3:
-            raise ValueError(f"SpatialSoftmax expected CHW input shape, got {input_shape}.")
-        self._in_c, self._in_h, self._in_w = input_shape
-        self._num_kp = int(num_kp) if num_kp is not None else self._in_c
-        self.nets = nn.Conv2d(self._in_c, self._num_kp, kernel_size=1) if num_kp is not None else None
-        self.learnable_temperature = learnable_temperature
-        self.output_variance = output_variance
-        self.noise_std = noise_std
-        temp = torch.ones(1) * float(temperature)
-        if learnable_temperature:
-            self.register_parameter("temperature", nn.Parameter(temp, requires_grad=True))
-        else:
-            self.register_buffer("temperature", temp)
-
-        pos_x, pos_y = np.meshgrid(
-            np.linspace(-1.0, 1.0, self._in_w),
-            np.linspace(-1.0, 1.0, self._in_h),
-        )
-        self.register_buffer("pos_x", torch.from_numpy(pos_x.reshape(1, self._in_h * self._in_w)).float())
-        self.register_buffer("pos_y", torch.from_numpy(pos_y.reshape(1, self._in_h * self._in_w)).float())
-        self.kps: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None = None
-
-    def output_shape(self, input_shape: tuple[int, int, int]) -> list[int]:
-        if len(input_shape) != 3 or input_shape[0] != self._in_c:
-            raise ValueError(f"SpatialSoftmax got incompatible input shape {input_shape}.")
-        return [self._num_kp, 2]
-
-    def forward(self, feature: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if feature.shape[1:] != (self._in_c, self._in_h, self._in_w):
-            raise ValueError(
-                f"SpatialSoftmax expected [B,{self._in_c},{self._in_h},{self._in_w}], got {tuple(feature.shape)}."
-            )
-        if self.nets is not None:
-            feature = self.nets(feature)
-
-        attention = F.softmax(feature.reshape(-1, self._in_h * self._in_w) / self.temperature, dim=-1)
-        expected_x = torch.sum(self.pos_x * attention, dim=1, keepdim=True)
-        expected_y = torch.sum(self.pos_y * attention, dim=1, keepdim=True)
-        feature_keypoints = torch.cat([expected_x, expected_y], dim=1).view(-1, self._num_kp, 2)
-        if self.training and self.noise_std > 0:
-            feature_keypoints = feature_keypoints + torch.randn_like(feature_keypoints) * self.noise_std
-
-        if self.output_variance:
-            expected_xx = torch.sum(self.pos_x * self.pos_x * attention, dim=1, keepdim=True)
-            expected_yy = torch.sum(self.pos_y * self.pos_y * attention, dim=1, keepdim=True)
-            expected_xy = torch.sum(self.pos_x * self.pos_y * attention, dim=1, keepdim=True)
-            var_x = expected_xx - expected_x * expected_x
-            var_y = expected_yy - expected_y * expected_y
-            var_xy = expected_xy - expected_x * expected_y
-            feature_covar = torch.cat([var_x, var_xy, var_xy, var_y], dim=1).reshape(-1, self._num_kp, 2, 2)
-            self.kps = (feature_keypoints.detach(), feature_covar.detach())
-            return feature_keypoints, feature_covar
-
-        self.kps = feature_keypoints.detach()
-        return feature_keypoints
-
-
-class VisualCore(nn.Module):
-    def __init__(
-        self,
-        input_shape: tuple[int, int, int],
-        backbone_class: str = "ResNet18Conv",
-        pool_class: str = "SpatialSoftmax",
-        backbone_kwargs: dict[str, Any] | None = None,
-        pool_kwargs: dict[str, Any] | None = None,
-        flatten: bool = True,
-        feature_dimension: int | None = 64,
-    ) -> None:
-        super().__init__()
-        if backbone_class != "ResNet18Conv":
-            raise ValueError("Local VisualCore only supports backbone_class='ResNet18Conv'.")
-        if pool_class not in {"SpatialSoftmax", None}:
-            raise ValueError("Local VisualCore only supports pool_class='SpatialSoftmax' or None.")
-        self.input_shape = tuple(input_shape)
-        self.flatten = bool(flatten)
-        backbone_kwargs = dict(backbone_kwargs or {})
-        backbone_kwargs["input_channel"] = self.input_shape[0]
-        self.backbone = ResNet18Conv(**backbone_kwargs)
-        feat_shape = self.backbone.output_shape(self.input_shape)
-        net_list: list[nn.Module] = [self.backbone]
-
-        self.pool: SpatialSoftmax | None = None
-        if pool_class is not None:
-            pool_kwargs = dict(pool_kwargs or {})
-            pool_kwargs["input_shape"] = tuple(feat_shape)
-            self.pool = SpatialSoftmax(**pool_kwargs)
-            feat_shape = self.pool.output_shape(tuple(feat_shape))
-            net_list.append(self.pool)
-        if self.flatten:
-            net_list.append(nn.Flatten(start_dim=1, end_dim=-1))
-        self.feature_dimension = feature_dimension
-        if feature_dimension is not None:
-            if not self.flatten:
-                raise ValueError("feature_dimension requires flatten=True.")
-            net_list.append(nn.Linear(int(np.prod(feat_shape)), int(feature_dimension)))
-        self.nets = nn.Sequential(*net_list)
-
-    def output_shape(self, input_shape: tuple[int, int, int]) -> list[int]:
-        if self.feature_dimension is not None:
-            return [int(self.feature_dimension)]
-        feat_shape = self.backbone.output_shape(input_shape)
-        if self.pool is not None:
-            feat_shape = self.pool.output_shape(tuple(feat_shape))
-        if self.flatten:
-            return [int(np.prod(feat_shape))]
-        return list(feat_shape)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if tuple(inputs.shape[-3:]) != self.input_shape:
-            raise ValueError(f"VisualCore expected input shape {self.input_shape}, got {tuple(inputs.shape[-3:])}.")
-        return self.nets(inputs)
-
-
 class CropRandomizer(nn.Module):
     def __init__(
         self,
@@ -266,110 +141,6 @@ class CropRandomizer(nn.Module):
         return inputs.reshape(batch_size, self.num_crops, *inputs.shape[1:]).mean(dim=1)
 
 
-class ObservationEncoder(nn.Module):
-    def __init__(
-        self,
-        obs_shapes: OrderedDict[str, tuple[int, ...]],
-        rgb_cfg: dict[str, Any] | None = None,
-        feature_activation: type[nn.Module] | None = nn.ReLU,
-    ) -> None:
-        super().__init__()
-        rgb_cfg = dict(rgb_cfg or {})
-        self.obs_shapes = obs_shapes
-        self.obs_nets = nn.ModuleDict()
-        self.obs_randomizers = nn.ModuleDict()
-        self.feature_activation = feature_activation() if feature_activation is not None else None
-
-        for key, shape in self.obs_shapes.items():
-            modality = OBS_KEY_MODALITIES[key]
-            if modality == "rgb":
-                randomizer = CropRandomizer(
-                    input_shape=tuple(shape),
-                    crop_height=int(rgb_cfg.get("crop_height", 216)),
-                    crop_width=int(rgb_cfg.get("crop_width", 216)),
-                    num_crops=int(rgb_cfg.get("num_crops", 1)),
-                    pos_enc=bool(rgb_cfg.get("pos_enc", False)),
-                )
-                randomized_shape = randomizer.output_shape_in(tuple(shape))
-                self.obs_randomizers[key] = nn.ModuleList([randomizer])
-                self.obs_nets[key] = VisualCore(
-                    input_shape=tuple(randomized_shape),
-                    backbone_class=rgb_cfg.get("backbone_class", "ResNet18Conv"),
-                    pool_class=rgb_cfg.get("pool_class", "SpatialSoftmax"),
-                    backbone_kwargs={
-                        "pretrained": bool(rgb_cfg.get("pretrained", False)),
-                        "input_coord_conv": bool(rgb_cfg.get("input_coord_conv", False)),
-                    },
-                    pool_kwargs={
-                        "num_kp": int(rgb_cfg.get("num_kp", 32)),
-                        "learnable_temperature": bool(rgb_cfg.get("learnable_temperature", False)),
-                        "temperature": float(rgb_cfg.get("temperature", 1.0)),
-                        "noise_std": float(rgb_cfg.get("noise_std", 0.0)),
-                    },
-                    feature_dimension=int(rgb_cfg.get("feature_dimension", 64)),
-                )
-            else:
-                self.obs_randomizers[key] = nn.ModuleList([])
-                self.obs_nets[key] = nn.Identity()
-
-    def forward(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
-        if not set(self.obs_shapes).issubset(obs_dict):
-            raise ValueError(f"ObservationEncoder missing keys: {sorted(set(self.obs_shapes) - set(obs_dict))}.")
-        feats = []
-        for key, shape in self.obs_shapes.items():
-            x = obs_dict[key]
-            for rand in self.obs_randomizers[key]:
-                x = rand.forward_in(x)
-            if OBS_KEY_MODALITIES[key] == "rgb":
-                x = self.obs_nets[key](x)
-                if self.feature_activation is not None:
-                    x = self.feature_activation(x)
-            for rand in reversed(self.obs_randomizers[key]):
-                x = rand.forward_out(x)
-            feats.append(_flatten_batch(x))
-        return torch.cat(feats, dim=-1)
-
-    def output_shape(self) -> list[int]:
-        feat_dim = 0
-        for key, shape in self.obs_shapes.items():
-            feat_shape: list[int] | tuple[int, ...] = shape
-            for rand in self.obs_randomizers[key]:
-                feat_shape = rand.output_shape_in(tuple(feat_shape))
-            if OBS_KEY_MODALITIES[key] == "rgb":
-                feat_shape = self.obs_nets[key].output_shape(tuple(feat_shape))
-            for rand in self.obs_randomizers[key]:
-                feat_shape = rand.output_shape_out(feat_shape)
-            feat_dim += int(np.prod(feat_shape))
-        return [feat_dim]
-
-
-class ObservationGroupEncoder(nn.Module):
-    def __init__(
-        self,
-        observation_group_shapes: OrderedDict[str, OrderedDict[str, tuple[int, ...]]],
-        rgb_cfg: dict[str, Any] | None = None,
-        feature_activation: type[nn.Module] | None = nn.ReLU,
-    ) -> None:
-        super().__init__()
-        self.observation_group_shapes = observation_group_shapes
-        self.nets = nn.ModuleDict(
-            {
-                obs_group: ObservationEncoder(obs_shapes, rgb_cfg=rgb_cfg, feature_activation=feature_activation)
-                for obs_group, obs_shapes in self.observation_group_shapes.items()
-            }
-        )
-
-    def forward(self, **inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-        if not set(self.observation_group_shapes).issubset(inputs):
-            raise ValueError(
-                f"ObservationGroupEncoder missing groups: {sorted(set(self.observation_group_shapes) - set(inputs))}."
-            )
-        return torch.cat([self.nets[obs_group](inputs[obs_group]) for obs_group in self.observation_group_shapes], dim=-1)
-
-    def output_shape(self) -> list[int]:
-        return [sum(self.nets[obs_group].output_shape()[0] for obs_group in self.observation_group_shapes)]
-
-
 def _replace_bn_with_gn(root_module: nn.Module, features_per_group: int = 16) -> nn.Module:
     for name, child in list(root_module.named_children()):
         if isinstance(child, nn.BatchNorm2d):
@@ -380,7 +151,62 @@ def _replace_bn_with_gn(root_module: nn.Module, features_per_group: int = 16) ->
     return root_module
 
 
+class ObservationFeatureMapEncoder(nn.Module):
+    def __init__(
+        self,
+        obs_shapes: OrderedDict[str, tuple[int, ...]],
+        rgb_cfg: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        rgb_cfg = dict(rgb_cfg or {})
+        self.obs_shapes = obs_shapes
+        self.obs_nets = nn.ModuleDict()
+        self.obs_randomizers = nn.ModuleDict()
+        self.feature_channels: dict[str, int] = {}
+
+        for key, shape in self.obs_shapes.items():
+            if OBS_KEY_MODALITIES[key] != "rgb":
+                raise ValueError(f"ObservationFeatureMapEncoder only supports rgb-like keys, got {key!r}.")
+            if rgb_cfg.get("backbone_class", "ResNet18Conv") != "ResNet18Conv":
+                raise ValueError("Local CNN backbone only supports backbone_class='ResNet18Conv'.")
+            randomizer = CropRandomizer(
+                input_shape=tuple(shape),
+                crop_height=int(rgb_cfg.get("crop_height", 216)),
+                crop_width=int(rgb_cfg.get("crop_width", 216)),
+                num_crops=int(rgb_cfg.get("num_crops", 1)),
+                pos_enc=bool(rgb_cfg.get("pos_enc", False)),
+            )
+            randomized_shape = randomizer.output_shape_in(tuple(shape))
+            self.obs_randomizers[key] = nn.ModuleList([randomizer])
+            net = ResNet18Conv(
+                input_channel=int(randomized_shape[0]),
+                pretrained=bool(rgb_cfg.get("pretrained", False)),
+                input_coord_conv=bool(rgb_cfg.get("input_coord_conv", False)),
+            )
+            self.obs_nets[key] = net
+            self.feature_channels[key] = int(net.output_shape(tuple(randomized_shape))[0])
+
+    def forward(self, obs_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not set(self.obs_shapes).issubset(obs_dict):
+            raise ValueError(f"ObservationFeatureMapEncoder missing keys: {sorted(set(self.obs_shapes) - set(obs_dict))}.")
+        features = {}
+        for key in self.obs_shapes:
+            x = obs_dict[key]
+            for rand in self.obs_randomizers[key]:
+                x = rand.forward_in(x)
+            x = self.obs_nets[key](x)
+            for rand in reversed(self.obs_randomizers[key]):
+                x = rand.forward_out(x)
+            features[key] = x
+        return features
+
+
 class RobomimicCNNBackbone(nn.Module):
+    dino_feature_names_by_view = {
+        0: "agentview_dino",
+        1: "robot0_eye_in_hand_dino",
+    }
+
     def __init__(
         self,
         state_dim: int,
@@ -389,6 +215,8 @@ class RobomimicCNNBackbone(nn.Module):
         use_left_only: bool = True,
         use_disparity: bool = False,
         rgb_cfg: dict[str, Any] | None = None,
+        rgb_encoder_cfg: dict[str, Any] | None = None,
+        dino: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if state_dim != 23:
@@ -398,39 +226,65 @@ class RobomimicCNNBackbone(nn.Module):
         self.image_size = tuple(image_size)
         self.use_left_only = bool(use_left_only)
         self.use_disparity = bool(use_disparity)
+        self.expects_sequence_input = True
 
         height, width = self.image_size
-        obs_shapes = OrderedDict(
+        image_shapes = OrderedDict(
             [
                 ("agentview_image", (3, height, width)),
                 *([("agentview_disp", (1, height, width))] if self.use_disparity else []),
-                ("object", (14,)),
-                ("robot0_eef_pos", (3,)),
-                ("robot0_eef_quat", (4,)),
                 ("robot0_eye_in_hand_image", (3, height, width)),
                 *([("robot0_eye_in_hand_disp", (1, height, width))] if self.use_disparity else []),
-                ("robot0_gripper_qpos", (2,)),
             ]
         )
         if not self.use_left_only:
-            obs_shapes["agentview_right_image"] = (3, height, width)
-            obs_shapes["robot0_eye_in_hand_right_image"] = (3, height, width)
-        observation_group_shapes = OrderedDict(
-            [
-                (
-                    "obs",
-                    obs_shapes,
-                )
-            ]
-        )
-        self.obs_encoder = ObservationGroupEncoder(
-            observation_group_shapes=observation_group_shapes,
-            rgb_cfg=rgb_cfg,
-        )
-        rgb_cfg = dict(rgb_cfg or {})
-        if bool(rgb_cfg.get("replace_bn_with_gn", True)):
+            image_shapes["agentview_right_image"] = (3, height, width)
+            image_shapes["robot0_eye_in_hand_right_image"] = (3, height, width)
+        self.image_shapes = image_shapes
+        encoder_cfg = dict(rgb_encoder_cfg or rgb_cfg or {})
+        self.obs_encoder = ObservationFeatureMapEncoder(self.image_shapes, rgb_cfg=encoder_cfg)
+        if bool(encoder_cfg.get("replace_bn_with_gn", True)):
             self.obs_encoder = _replace_bn_with_gn(self.obs_encoder)
-        self.output_dim = int(self.obs_encoder.output_shape()[0]) * observation_horizon
+        dino_cfg = dict(dino or {})
+        self.dino_enabled = bool(dino_cfg.get("enabled", False))
+        self.dino_view_indices = tuple(int(idx) for idx in dino_cfg.get("view_indices", [0, 1]))
+        self.dino_feature_channels = int(dino_cfg.get("output_channels", 128))
+        self.dino: DinoDenseFeatureBranch | None = None
+        self.dino_feature_names = (
+            tuple(
+                self.dino_feature_names_by_view[idx]
+                for idx in self.dino_view_indices
+                if idx in self.dino_feature_names_by_view
+            )
+            if self.dino_enabled
+            else ()
+        )
+        if self.dino_enabled and len(self.dino_feature_names) != len(self.dino_view_indices):
+            supported = ", ".join(str(idx) for idx in sorted(self.dino_feature_names_by_view))
+            raise ValueError(f"backbone.dino.view_indices only supports native DP views: {supported}.")
+        if self.dino_enabled and self.dino_view_indices:
+            dino_backend = dino_cfg.get("backend")
+            if dino_backend is None and (
+                dino_cfg.get("torchhub_model") is not None or dino_cfg.get("checkpoint_path") is not None
+            ):
+                dino_backend = "torchhub"
+            self.dino = DinoDenseFeatureBranch(
+                model_name=dino_cfg.get("model_name", "facebook/dinov2-base"),
+                backend=dino_backend or "huggingface",
+                torchhub_model=dino_cfg.get("torchhub_model", "dinov2_vitb14"),
+                repo_or_dir=dino_cfg.get("repo_or_dir", "facebookresearch/dinov2"),
+                source=dino_cfg.get("source", "github"),
+                checkpoint_path=dino_cfg.get("checkpoint_path"),
+                output_channels=self.dino_feature_channels,
+                local_files_only=bool(dino_cfg.get("local_files_only", True)),
+                freeze=bool(dino_cfg.get("freeze", True)),
+                projection="linear",
+            )
+        self.feature_names = (*self.image_shapes.keys(), *self.dino_feature_names)
+        self.feature_channels = dict(self.obs_encoder.feature_channels)
+        self.feature_channels.update({name: self.dino_feature_channels for name in self.dino_feature_names})
+        self.feature_view_counts = {name: 1 for name in self.feature_names}
+        self.output_dim = None
 
     @staticmethod
     def split_state(state: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -478,13 +332,31 @@ class RobomimicCNNBackbone(nn.Module):
             obs["robot0_eye_in_hand_right_image"] = (right[:, :, 1].float() / 255.0).clamp(0.0, 1.0)
         return obs
 
+    def _dino_features(self, left: torch.Tensor, batch: int, time: int) -> dict[str, torch.Tensor]:
+        if not self.dino_enabled or not self.dino_feature_names:
+            return {}
+        if self.dino is None:
+            raise RuntimeError("DINO features are enabled but the DINO branch is not configured.")
+
+        out: dict[str, torch.Tensor] = {}
+        patch_size = int(getattr(self.dino, "patch_size", 14))
+        output_size = (
+            max(int(left.shape[-2]) // patch_size, 1),
+            max(int(left.shape[-1]) // patch_size, 1),
+        )
+        for view_idx, name in zip(self.dino_view_indices, self.dino_feature_names):
+            image = left[:, :, view_idx].reshape(batch * time, *left.shape[3:])
+            feature = self.dino(image, output_size=output_size)
+            out[name] = feature.view(batch, time, *feature.shape[1:])
+        return out
+
     def forward(
         self,
         left: torch.Tensor,
         right: torch.Tensor,
         state: torch.Tensor,
         disparity: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         obs = self.make_obs_dict(left, right, state, disparity)
         batch, time = state.shape[:2]
         if time != self.observation_horizon:
@@ -494,17 +366,20 @@ class RobomimicCNNBackbone(nn.Module):
         flat_obs = {
             key: value.reshape(batch * time, *value.shape[2:])
             for key, value in obs.items()
+            if key in self.image_shapes
         }
-        obs_features = self.obs_encoder(obs=flat_obs).view(batch, time, -1)
-        return obs_features.flatten(start_dim=1)
+        flat_features = self.obs_encoder(flat_obs)
+        features = {
+            key: value.view(batch, time, *value.shape[1:])
+            for key, value in flat_features.items()
+        }
+        features.update(self._dino_features(left, batch, time))
+        return features
 
 
 __all__ = [
     "CropRandomizer",
-    "ObservationEncoder",
-    "ObservationGroupEncoder",
+    "ObservationFeatureMapEncoder",
     "ResNet18Conv",
     "RobomimicCNNBackbone",
-    "SpatialSoftmax",
-    "VisualCore",
 ]
