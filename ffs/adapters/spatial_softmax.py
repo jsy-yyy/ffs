@@ -72,12 +72,14 @@ class SpatialSoftmaxAdapter(BaseAdapter):
         noise_std: float = 0.0,
         learnable_temperature: bool = False,
         projection_dim: int | None = None,
+        flatten: bool = True,
     ) -> None:
         super().__init__()
         self.feature_names = resolve_feature_names(feature_names, backbone)
         self.num_history_frames = int(policy_cfg.get("observation_horizon", policy_cfg["num_history_frames"]))
         self.state_dim = int(policy_cfg["state_dim"])
         self.num_stereo_pairs = len(dataset_cfg.get("camera_pairs", []))
+        self.flatten = bool(flatten)
         if self.num_stereo_pairs <= 0:
             raise ValueError("dataset.camera_pairs must contain at least one stereo pair.")
 
@@ -104,6 +106,12 @@ class SpatialSoftmaxAdapter(BaseAdapter):
         pooled_dim = int(num_kp) * 2
         self.projection_dim = int(projection_dim) if projection_dim is not None else None
         self.feature_dim = self.projection_dim or pooled_dim
+        self.token_dim = self.feature_dim
+        if not self.flatten and self.state_dim > self.token_dim:
+            raise ValueError(
+                "adapter.type='spatial_softmax' with flatten=false requires state_dim <= token_dim "
+                f"for zero-padded state tokens; got state_dim={self.state_dim}, token_dim={self.token_dim}."
+            )
         self.projections = nn.ModuleDict()
         if self.projection_dim is not None:
             self.projections = nn.ModuleDict(
@@ -115,6 +123,13 @@ class SpatialSoftmaxAdapter(BaseAdapter):
             for name in self.feature_names
         )
         self.cond_dim = self.num_history_frames * (self.visual_dim_per_frame + self.state_dim)
+        self.visual_tokens_per_frame = sum(
+            feature_view_count(backbone, name, self.num_stereo_pairs)
+            for name in self.feature_names
+        )
+        self.tokens_per_frame = self.visual_tokens_per_frame + 1
+        self.condition_len = self.num_history_frames * self.tokens_per_frame
+        self.output_kind = "cond" if self.flatten else "tokens"
 
     def _pool_feature(
         self,
@@ -154,6 +169,18 @@ class SpatialSoftmaxAdapter(BaseAdapter):
             pooled = self.projections[name](pooled)
         return pooled.view(*leading, -1)
 
+    def _state_tokens(self, state: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+        tokens = torch.zeros(
+            state.shape[0],
+            state.shape[1],
+            1,
+            self.token_dim,
+            device=state.device,
+            dtype=dtype,
+        )
+        tokens[..., : self.state_dim] = state.float().to(dtype=dtype).unsqueeze(2)
+        return tokens
+
     def forward(
         self,
         backbone_out: dict[str, torch.Tensor],
@@ -174,10 +201,25 @@ class SpatialSoftmaxAdapter(BaseAdapter):
         parts = []
         for name in self.feature_names:
             pooled = self._pool_feature(name, backbone_out[name], batch=batch, time=time, views=views)
-            parts.append(pooled.flatten(start_dim=2))
-        visual = torch.cat(parts, dim=-1)
-        cond = torch.cat([visual, state.float()], dim=-1)
-        return AdapterOutput(cond=cond.flatten(start_dim=1))
+            if self.flatten:
+                parts.append(pooled.flatten(start_dim=2))
+            else:
+                parts.append(pooled.reshape(batch, time, -1, self.token_dim))
+
+        if self.flatten:
+            visual = torch.cat(parts, dim=-1)
+            cond = torch.cat([visual, state.float()], dim=-1)
+            return AdapterOutput(cond=cond.flatten(start_dim=1))
+
+        visual_tokens = torch.cat(parts, dim=2)
+        state_tokens = self._state_tokens(state, dtype=visual_tokens.dtype)
+        tokens = torch.cat([visual_tokens, state_tokens], dim=2).flatten(1, 2)
+        if tokens.shape[1] != self.condition_len:
+            raise ValueError(
+                f"spatial_softmax inferred condition_len={self.condition_len}, "
+                f"but runtime features produced {tokens.shape[1]} tokens."
+            )
+        return AdapterOutput(tokens=tokens)
 
 
 __all__ = ["DynamicSpatialSoftmax", "SpatialSoftmaxAdapter"]

@@ -202,6 +202,13 @@ def build_policy(cfg: dict[str, Any]) -> BackboneAdapterHeadPolicy:
     if not isinstance(adapter_cfg, dict):
         raise ValueError("adapter section is required in the new backbone/adapter/head schema.")
     head_cfg = cfg.get("head", {})
+    adapter_cfg = dict(adapter_cfg)
+    if (
+        adapter_cfg.get("type") == "spatial_softmax"
+        and head_cfg.get("type") == "rdt"
+        and "flatten" not in adapter_cfg
+    ):
+        adapter_cfg["flatten"] = False
 
     backbone, disparity_provider, disparity_max_disp = _build_backbone(
         backbone_cfg=backbone_cfg,
