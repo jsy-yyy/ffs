@@ -298,10 +298,16 @@ def train(args: argparse.Namespace) -> None:
             right = batch["right"].to(device, non_blocking=True)
             state = batch["state"].to(device, non_blocking=True)
             action = batch["action"].to(device, non_blocking=True)
+            task_id = batch.get("task_id")
+            if task_id is not None:
+                task_id = task_id.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, use_amp):
-                loss = model(left, right, state, action)
+                if task_id is None:
+                    loss = model(left, right, state, action)
+                else:
+                    loss = model(left, right, state, action, task_id=task_id)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()

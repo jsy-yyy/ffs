@@ -65,6 +65,8 @@ class RobomimicFFSService:
         }
 
         self.model = build_policy(self.cfg).to(self.device)
+        self.task_condition_enabled = bool(getattr(self.model, "task_condition_enabled", False))
+        self.task_to_id = dict(getattr(self.model, "task_to_id", {}))
         ckpt = torch.load(checkpoint, map_location=self.device, weights_only=False)
         self.action_normalizer = _make_action_normalizer(
             ActionNormalizer,
@@ -100,6 +102,8 @@ class RobomimicFFSService:
             "image_size": list(self.image_size) if self.image_size is not None else None,
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
+            "task_condition_enabled": self.task_condition_enabled,
+            "task_to_id": self.task_to_id,
         }
 
     def set_seed(self, seed: int) -> None:
@@ -124,14 +128,31 @@ class RobomimicFFSService:
         }
         self.model.eval()
 
+    def _task_id_tensor(self) -> torch.Tensor | None:
+        if not self.task_condition_enabled:
+            return None
+        task_name = str(self.session.get("task_name", "unknown"))
+        if hasattr(self.model, "task_id_from_name"):
+            task_id = self.model.task_id_from_name(task_name)
+        else:
+            if task_name not in self.task_to_id:
+                valid = ", ".join(self.task_to_id)
+                raise KeyError(f"Unknown task name {task_name!r}; valid tasks: {valid}")
+            task_id = torch.tensor([self.task_to_id[task_name]], dtype=torch.long)
+        return task_id.to(self.device)
+
     def predict(self, obs: dict[str, Any]) -> dict[str, Any]:
         self._append_obs(obs)
         obs_window = self._history_window()
         left, right, state = self._make_batch(obs_window)
+        task_id = self._task_id_tensor()
         use_amp = self.amp and self.device.type == "cuda"
         autocast = torch.amp.autocast(device_type=self.device.type, enabled=use_amp) if hasattr(torch, "amp") else nullcontext()
         with torch.inference_mode(), autocast:
-            normalized = self.model(left, right, state)
+            if task_id is None:
+                normalized = self.model(left, right, state)
+            else:
+                normalized = self.model(left, right, state, task_id=task_id)
         actions = self.action_normalizer.denormalize_action(normalized[0].float()).detach().cpu().numpy()
         if actions.shape != (self.action_horizon, self.action_dim):
             raise ValueError(

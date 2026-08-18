@@ -166,11 +166,46 @@ def _build_diffusion_head(
     )
 
 
+
+def _resolve_task_condition(
+    policy_cfg: dict[str, Any],
+    dataset_cfg: dict[str, Any],
+) -> tuple[bool, tuple[str, ...], dict[str, int], int]:
+    task_cfg = policy_cfg.get("task_condition")
+    if not isinstance(task_cfg, dict) or not bool(task_cfg.get("enabled", False)):
+        return False, (), {}, 0
+    source = str(task_cfg.get("source", "task_id"))
+    if source != "task_id":
+        raise ValueError("policy.task_condition.source currently supports only 'task_id'.")
+
+    task_to_id_cfg = task_cfg.get("task_to_id")
+    if isinstance(task_to_id_cfg, dict):
+        task_to_id = {str(task): int(idx) for task, idx in task_to_id_cfg.items()}
+        if sorted(task_to_id.values()) != list(range(len(task_to_id))):
+            raise ValueError("policy.task_condition.task_to_id values must be contiguous ids starting at 0.")
+        task_names = tuple(task for task, _ in sorted(task_to_id.items(), key=lambda item: item[1]))
+        return True, task_names, task_to_id, len(task_names)
+
+    raw_tasks = task_cfg.get("tasks", dataset_cfg.get("tasks"))
+    if raw_tasks is None:
+        num_tasks = int(task_cfg.get("num_tasks", 0))
+        if num_tasks <= 0:
+            raise ValueError("policy.task_condition requires dataset.tasks, task_condition.tasks, task_to_id, or num_tasks.")
+        return True, (), {}, num_tasks
+    task_names = tuple(str(task) for task in raw_tasks)
+    if not task_names:
+        raise ValueError("policy.task_condition needs at least one task.")
+    task_to_id = {task: idx for idx, task in enumerate(task_names)}
+    if len(task_to_id) != len(task_names):
+        raise ValueError("policy.task_condition task names must be unique.")
+    return True, task_names, task_to_id, len(task_names)
+
 def _build_head(
     *,
     head_cfg: dict[str, Any],
     adapter: nn.Module,
     policy_cfg: dict[str, Any],
+    extra_condition_tokens: int = 0,
 ) -> nn.Module:
     head_type = head_cfg.get("type", "mlp")
     if head_type == "diffusion_unet":
@@ -181,14 +216,15 @@ def _build_head(
     if getattr(adapter, "output_kind", None) != "tokens":
         raise ValueError(f"head.type={head_type!r} requires an adapter with output_kind='tokens'.")
     action_head_cfg = resolve_action_head_cfg(head_cfg)
+    condition_len = int(adapter.condition_len) + int(extra_condition_tokens)
     return build_action_head(
         action_head_cfg,
-        input_dim=int(adapter.condition_len) * int(adapter.token_dim),
+        input_dim=condition_len * int(adapter.token_dim),
         action_dim=int(policy_cfg["action_dim"]),
         action_horizon=int(policy_cfg["action_horizon"]),
         prediction_horizon=int(policy_cfg.get("prediction_horizon", policy_cfg["action_horizon"])),
         frame_token_dim=int(adapter.token_dim),
-        condition_len=int(adapter.condition_len),
+        condition_len=condition_len,
         num_history_frames=int(policy_cfg["num_history_frames"]),
         tokens_per_frame=int(adapter.tokens_per_frame),
     )
@@ -217,7 +253,13 @@ def build_policy(cfg: dict[str, Any]) -> BackboneAdapterHeadPolicy:
         image_size=dataset_cfg.get("image_size", [224, 224]),
     )
     adapter = build_adapter(adapter_cfg, backbone=backbone, policy_cfg=policy_cfg, dataset_cfg=dataset_cfg)
-    action_head = _build_head(head_cfg=head_cfg, adapter=adapter, policy_cfg=policy_cfg)
+    task_condition_enabled, _, task_to_id, num_tasks = _resolve_task_condition(policy_cfg, dataset_cfg)
+    action_head = _build_head(
+        head_cfg=head_cfg,
+        adapter=adapter,
+        policy_cfg=policy_cfg,
+        extra_condition_tokens=1 if task_condition_enabled else 0,
+    )
     return BackboneAdapterHeadPolicy(
         backbone=backbone,
         adapter=adapter,
@@ -228,6 +270,9 @@ def build_policy(cfg: dict[str, Any]) -> BackboneAdapterHeadPolicy:
         disparity_provider=disparity_provider,
         disparity_max_disp=disparity_max_disp,
         disparity_ablation=policy_cfg.get("disparity_ablation", "none"),
+        task_condition_enabled=task_condition_enabled,
+        num_tasks=num_tasks,
+        task_to_id=task_to_id,
     )
 
 

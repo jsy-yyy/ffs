@@ -1,0 +1,104 @@
+backbone:
+  type: waft-based
+  waft_root: /data/jsy/WAFT-Stereo
+  config_path: /data/jsy/WAFT-Stereo/configs/SynLarge/DAv2S-4.yaml
+  checkpoint_path: /data/jsy/WAFT-Stereo/weights/SynLarge/DAv2S-4.pth
+  feature_names:
+  - refine_net
+  freeze: true
+  amp_dtype: bfloat16
+  max_disp: 800
+dataset:
+  type: robotwin_hdf5_dataset
+  root: /mnt/nas/datasets5/jsy_robotwin
+  image_size:
+  - 256
+  - 320
+  camera_pairs:
+  - - head_stereo.left
+    - head_stereo.right
+  configs:
+  - demo_clean_nas50
+  - demo_randomized_nas500
+  tasks:
+  - adjust_bottle
+  - beat_block_hammer
+  - blocks_ranking_rgb
+  - blocks_ranking_size
+  - click_alarmclock
+  - click_bell
+  - dump_bin_bigbin
+  - grab_roller
+  - handover_block
+  - handover_mic
+policy:
+  num_history_frames: 2
+  observation_horizon: 2
+  action_horizon: 8
+  prediction_horizon: 16
+  action_dim: 16
+  state_dim: 16
+adapter:
+  type: reshape_tokens
+  feature_names: auto
+  flatten: false
+  saliency:
+    enabled: true
+    source_feature: refine_net
+    grid_size:
+    - 14
+    - 14
+    mode: attention_bias
+    bias_strength: 2.0
+    keep_ratio: 0.1
+    sparsity_loss_weight: 0.001
+    entropy_loss_weight: 0.0001
+head:
+  type: rdt
+  rdt:
+    hidden_size: 256
+    depth: 4
+    num_heads: 8
+    num_kv_heads: 8
+    norm_eps: 1.0e-05
+    multiple_of: 256
+    use_flash_attn: true
+    num_register_tokens: 4
+    num_inference_steps: 10
+    sample_init: randn
+    act_adaptor: mlp3x_silu
+    state_adaptor: mlp3x_silu
+    vision_adaptor: linear
+    dtype: float32
+train:
+  output_dir: outputs/waft_rdt_robotwin
+  epochs: 5000
+  epoch_every_n_steps: 100
+  batch_size: 1
+  num_workers: 4
+  lr: 1e-4
+  weight_decay: 1.0e-06
+  scheduler_type: cosine
+  warmup_steps: 500
+  num_cycles: 0.5
+  amp: true
+  suppress_dynamo_errors: true
+  log_interval: 50
+  save_ckpt_interval: 20000
+  resume_from: null
+  ema:
+    enabled: true
+    power: 0.75
+    inv_gamma: 1.0
+    max_decay: 0.9999
+visualization:
+  query_attention:
+    enabled: false
+    mode: all
+    sources: all
+    view: all
+    time: -1
+    query: all
+    fps: 10
+    alpha: 0.45
+    max_frames: 200

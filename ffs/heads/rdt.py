@@ -31,7 +31,7 @@ def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torc
 def _get_1d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor) -> torch.Tensor:
     if embed_dim % 2 != 0:
         raise ValueError("RDT positional embeddings require an even hidden_size.")
-    omega = torch.arange(embed_dim // 2, dtype=torch.float64)
+    omega = torch.arange(embed_dim // 2, dtype=torch.float64, device=pos.device)
     omega = 1.0 / (10000 ** (omega / (embed_dim / 2.0)))
     out = pos.reshape(-1).to(torch.float64).unsqueeze(1) * omega.unsqueeze(0)
     return torch.cat([torch.sin(out), torch.cos(out)], dim=1).float()
@@ -62,6 +62,17 @@ def _multimodal_pos_embed(embed_dim: int, mm_lens: OrderedDict[str, int]) -> tor
         pos_emb[start : start + abs_len] = emb
         start += abs_len
     return pos_emb
+
+
+def _get_2d_sincos_pos_embed(embed_dim: int, pos: torch.Tensor) -> torch.Tensor:
+    if embed_dim % 4 != 0:
+        raise ValueError("2D positional embeddings require hidden_size divisible by 4.")
+    if pos.shape[-1] != 2:
+        raise ValueError(f"Expected token positions [...,2], got {tuple(pos.shape)}.")
+    half_dim = embed_dim // 2
+    y_emb = _get_1d_sincos_pos_embed(half_dim, pos[..., 0].reshape(-1))
+    x_emb = _get_1d_sincos_pos_embed(half_dim, pos[..., 1].reshape(-1))
+    return torch.cat([y_emb, x_emb], dim=-1).view(*pos.shape[:-1], embed_dim)
 
 
 def _repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -167,7 +178,6 @@ class Attention(nn.Module):
                 attn_mask=None,
                 dropout_p=0.0,
                 is_causal=False,
-                scale=self.attn_scale,
             )
         else:
             scores = torch.matmul(xq, xk.transpose(2, 3)) * self.attn_scale
@@ -212,6 +222,7 @@ class CrossAttention(nn.Module):
         x: torch.Tensor,
         c: torch.Tensor,
         mask: torch.Tensor | None = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, seq_len, _ = x.shape
         _, cond_len, _ = c.shape
@@ -230,8 +241,19 @@ class CrossAttention(nn.Module):
         cv = cv.transpose(1, 2)
 
         attn_mask = None
+        if bias is not None:
+            if bias.shape != (batch, cond_len):
+                raise ValueError(f"CrossAttention bias expected shape {(batch, cond_len)}, got {tuple(bias.shape)}.")
+            attn_mask = bias.to(device=x.device, dtype=xq.dtype).reshape(batch, 1, 1, cond_len)
+            attn_mask = attn_mask.expand(-1, -1, seq_len, -1)
         if mask is not None:
-            attn_mask = mask.reshape(batch, 1, 1, cond_len).expand(-1, -1, seq_len, -1)
+            if mask.shape != (batch, cond_len):
+                raise ValueError(f"CrossAttention mask expected shape {(batch, cond_len)}, got {tuple(mask.shape)}.")
+            keep = mask.reshape(batch, 1, 1, cond_len).expand(-1, -1, seq_len, -1)
+            if attn_mask is None:
+                attn_mask = keep
+            else:
+                attn_mask = attn_mask.masked_fill(keep.logical_not(), float("-inf"))
 
         if self.use_flash_attn:
             out = F.scaled_dot_product_attention(
@@ -241,12 +263,14 @@ class CrossAttention(nn.Module):
                 attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=False,
-                scale=self.attn_scale,
             )
         else:
             scores = torch.matmul(xq, ck.transpose(2, 3)) * self.attn_scale
             if attn_mask is not None:
-                scores = scores.masked_fill(attn_mask.logical_not(), float("-inf"))
+                if attn_mask.dtype == torch.bool:
+                    scores = scores.masked_fill(attn_mask.logical_not(), float("-inf"))
+                else:
+                    scores = scores + attn_mask
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             out = torch.matmul(scores, cv)
 
@@ -324,6 +348,7 @@ class RDTBlock(nn.Module):
         t_state: torch.Tensor,
         condition: torch.Tensor,
         condition_mask: torch.Tensor | None = None,
+        condition_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         shift_attn, scale_attn, gate_attn, shift_cross, scale_cross, gate_cross, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(t_state).chunk(9, dim=1)
@@ -336,6 +361,7 @@ class RDTBlock(nn.Module):
             _modulate(self.cross_norm(h), shift_cross, scale_cross),
             c=self.cond_norm(condition),
             mask=condition_mask,
+            bias=condition_bias,
         )
         return h + gate_mlp.unsqueeze(1) * self.ffn(
             _modulate(self.ffn_norm(h), shift_mlp, scale_mlp)
@@ -537,7 +563,12 @@ class RDTActionHead(ActionHead):
             return torch.zeros(shape, device=frame_tokens.device, dtype=self.param_dtype)
         return torch.randn(shape, device=frame_tokens.device, dtype=self.param_dtype)
 
-    def _prepare_conditions(self, frame_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _prepare_conditions(
+        self,
+        frame_tokens: torch.Tensor,
+        condition_bias: torch.Tensor | None = None,
+        token_positions: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         if frame_tokens.shape[1] != self.condition_len:
             raise ValueError(
                 f"RDTActionHead expected {self.condition_len} condition tokens, got {frame_tokens.shape[1]}."
@@ -557,16 +588,38 @@ class RDTActionHead(ActionHead):
         vision_tokens = tokens[:, cond_mask, :]
         if vision_tokens.shape[1] == 0:
             raise ValueError("RDTActionHead needs at least one non-state condition token.")
+        vision_positions = None
+        if token_positions is not None:
+            if token_positions.shape != (tokens.shape[0], self.condition_len, 2):
+                raise ValueError(
+                    "RDTActionHead token_positions expected shape "
+                    f"{(tokens.shape[0], self.condition_len, 2)}, got {tuple(token_positions.shape)}."
+                )
+            vision_positions = token_positions.to(device=tokens.device, dtype=self.param_dtype)[:, cond_mask, :]
+        vision_bias = None
+        if condition_bias is not None:
+            if condition_bias.shape != (tokens.shape[0], self.condition_len):
+                raise ValueError(
+                    "RDTActionHead condition_bias expected shape "
+                    f"{(tokens.shape[0], self.condition_len)}, got {tuple(condition_bias.shape)}."
+                )
+            vision_bias = condition_bias.to(device=tokens.device, dtype=self.param_dtype)[:, cond_mask]
 
         vision_cond = self.vision_adaptor(vision_tokens)
-        vision_cond = vision_cond + self.vision_pos_emb[:, : vision_cond.shape[1]]
+        if vision_positions is None:
+            vision_cond = vision_cond + self.vision_pos_emb[:, : vision_cond.shape[1]]
+        else:
+            vision_cond = vision_cond + _get_2d_sincos_pos_embed(
+                self.hidden_size,
+                vision_positions,
+            ).to(device=tokens.device, dtype=self.param_dtype)
         state_cond = self.state_adaptor(state_token) + self.state_pos_emb
         vision_mask = torch.ones(
             (tokens.shape[0], vision_cond.shape[1]),
             device=tokens.device,
             dtype=torch.bool,
         )
-        return vision_cond, state_cond, vision_mask
+        return vision_cond, state_cond, vision_mask, vision_bias
 
     def _predict_velocity(
         self,
@@ -575,6 +628,7 @@ class RDTActionHead(ActionHead):
         vision_cond: torch.Tensor,
         state_cond: torch.Tensor,
         vision_mask: torch.Tensor,
+        vision_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         x = self.act_adaptor(noisy_action.to(self.param_dtype))
         t = self.t_embedder(timestep.to(device=noisy_action.device))
@@ -591,17 +645,28 @@ class RDTActionHead(ActionHead):
                 t_state=t_state,
                 condition=vision_cond,
                 condition_mask=vision_mask,
+                condition_bias=vision_bias,
             )
         x = self.final_layer(x, t_state)
         return x[:, : self.prediction_horizon]
 
-    def training_loss(self, frame_tokens: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def training_loss(
+        self,
+        frame_tokens: torch.Tensor,
+        action: torch.Tensor,
+        condition_bias: torch.Tensor | None = None,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if action.shape[1] != self.prediction_horizon:
             raise ValueError(
                 f"RDTActionHead expected action prediction horizon {self.prediction_horizon}, "
                 f"got {action.shape[1]}."
             )
-        vision_cond, state_cond, vision_mask = self._prepare_conditions(frame_tokens)
+        vision_cond, state_cond, vision_mask, vision_bias = self._prepare_conditions(
+            frame_tokens,
+            condition_bias,
+            token_positions,
+        )
         action = action.to(self.param_dtype)
         noise = torch.randn_like(action)
         timesteps = self.timestep_sampler.sample((action.shape[0],))[:, 0].to(
@@ -615,11 +680,21 @@ class RDTActionHead(ActionHead):
             vision_cond=vision_cond,
             state_cond=state_cond,
             vision_mask=vision_mask,
+            vision_bias=vision_bias,
         )
         return F.mse_loss(pred, action - noise)
 
-    def forward(self, frame_tokens: torch.Tensor) -> torch.Tensor:
-        vision_cond, state_cond, vision_mask = self._prepare_conditions(frame_tokens)
+    def forward(
+        self,
+        frame_tokens: torch.Tensor,
+        condition_bias: torch.Tensor | None = None,
+        token_positions: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        vision_cond, state_cond, vision_mask, vision_bias = self._prepare_conditions(
+            frame_tokens,
+            condition_bias,
+            token_positions,
+        )
         noisy_action = self._initial_sample(frame_tokens)
         timestep = torch.tensor([0.0], device=frame_tokens.device, dtype=self.param_dtype)
         step_size = 1.0 / self.num_inference_steps
@@ -631,6 +706,7 @@ class RDTActionHead(ActionHead):
                 vision_cond=vision_cond,
                 state_cond=state_cond,
                 vision_mask=vision_mask,
+                vision_bias=vision_bias,
             )
             noisy_action = noisy_action + pred * step_size
             if self.clip_sample:

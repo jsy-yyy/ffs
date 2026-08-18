@@ -11,6 +11,9 @@ import torch.nn as nn
 class AdapterOutput:
     cond: torch.Tensor | None = None
     tokens: torch.Tensor | None = None
+    condition_bias: torch.Tensor | None = None
+    token_positions: torch.Tensor | None = None
+    aux_loss: torch.Tensor | None = None
     attention: dict[str, torch.Tensor] | None = None
 
 

@@ -7,8 +7,13 @@ import torch.nn.functional as F
 
 
 ROBOTWIN_STEREO_LEROBOT = "robotwin-stereo-lerobot"
+ROBOTWIN_HDF5_DATASET = "robotwin_hdf5_dataset"
 ROBOMIMIC_STEREO_LEROBOT = "robomimic-stereo-lerobot"
-STEREO_LEROBOT_DATASET_TYPES = (ROBOTWIN_STEREO_LEROBOT, ROBOMIMIC_STEREO_LEROBOT)
+STEREO_LEROBOT_DATASET_TYPES = (
+    ROBOTWIN_STEREO_LEROBOT,
+    ROBOTWIN_HDF5_DATASET,
+    ROBOMIMIC_STEREO_LEROBOT,
+)
 
 
 class ActionNormalizer:
@@ -138,6 +143,7 @@ def _resize_frame(frame: torch.Tensor, image_size: tuple[int, int] | None) -> to
 __all__ = [
     "ActionNormalizer",
     "ROBOMIMIC_STEREO_LEROBOT",
+    "ROBOTWIN_HDF5_DATASET",
     "ROBOTWIN_STEREO_LEROBOT",
     "STEREO_LEROBOT_DATASET_TYPES",
     "denormalize_action",

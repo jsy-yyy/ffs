@@ -6,10 +6,12 @@ from torch.utils.data import Dataset
 
 from .lerobot_common import (
     ROBOMIMIC_STEREO_LEROBOT,
+    ROBOTWIN_HDF5_DATASET,
     ROBOTWIN_STEREO_LEROBOT,
     STEREO_LEROBOT_DATASET_TYPES,
 )
 from .robomimic_stereo_lerobot import RobomimicStereoLeRobotDataset
+from .robotwin_hdf5_dataset import DEFAULT_ROBOTWIN_HDF5_ROOT, RobotwinHdf5Dataset
 from .robotwin_stereo_lerobot import (
     MultiRobotwinStereoLeRobotDataset,
     RobotwinStereoLeRobotDataset,
@@ -42,6 +44,17 @@ def build_stereo_lerobot_dataset(
         "num_episodes": dataset_cfg.get("num_episodes"),
         "action_normalization": dataset_cfg.get("action_normalization"),
     }
+
+    if dataset_type == ROBOTWIN_HDF5_DATASET:
+        return RobotwinHdf5Dataset(
+            root=dataset_cfg.get("root", DEFAULT_ROBOTWIN_HDF5_ROOT),
+            tasks=dataset_cfg.get("tasks"),
+            configs=dataset_cfg.get("configs"),
+            skip_incomplete=dataset_cfg.get("skip_incomplete", True),
+            max_scan_workers=dataset_cfg.get("max_scan_workers", 16),
+            max_open_video_readers=dataset_cfg.get("max_open_video_readers", 32),
+            **dataset_kwargs,
+        )
 
     if dataset_type == ROBOTWIN_STEREO_LEROBOT:
         if dataset_cfg.get("roots") is not None:

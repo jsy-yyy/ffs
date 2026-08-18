@@ -2,12 +2,14 @@ from .factory import build_stereo_lerobot_dataset, require_stereo_lerobot_datase
 from .lerobot_common import (
     ActionNormalizer,
     ROBOMIMIC_STEREO_LEROBOT,
+    ROBOTWIN_HDF5_DATASET,
     ROBOTWIN_STEREO_LEROBOT,
     STEREO_LEROBOT_DATASET_TYPES,
     denormalize_action,
     normalize_action,
 )
 from .robomimic_stereo_lerobot import RobomimicStereoLeRobotDataset
+from .robotwin_hdf5_dataset import DEFAULT_ROBOTWIN_HDF5_ROOT, RobotwinHdf5Dataset
 from .robotwin_stereo_lerobot import (
     MultiRobotwinStereoLeRobotDataset,
     RobotwinStereoLeRobotDataset,
@@ -18,9 +20,12 @@ from .robotwin_stereo_lerobot import (
 __all__ = [
     "ActionNormalizer",
     "MultiRobotwinStereoLeRobotDataset",
+    "DEFAULT_ROBOTWIN_HDF5_ROOT",
     "ROBOMIMIC_STEREO_LEROBOT",
+    "ROBOTWIN_HDF5_DATASET",
     "ROBOTWIN_STEREO_LEROBOT",
     "RobomimicStereoLeRobotDataset",
+    "RobotwinHdf5Dataset",
     "RobotwinStereoLeRobotDataset",
     "STEREO_LEROBOT_DATASET_TYPES",
     "absolute_action_to_relative_eef_pose",

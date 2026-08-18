@@ -9,20 +9,23 @@ backbone:
   optimize_build_volume: pytorch1
 
 dataset:
-  type: robotwin-stereo-lerobot
-  root: /data/jsy/Fast-FoundationStereo/lerobot_dataset_clean
+  type: robotwin_hdf5_dataset
+  root: /mnt/nas/datasets5/jsy_robotwin
   image_size: [256, 320]
   camera_pairs:
-    - [observation.images.head_camera_left, observation.images.head_camera_right]
-    - [observation.images.front_camera_left, observation.images.front_camera_right]
-    # - [observation.images.left_camera_left, observation.images.left_camera_right]
-    # - [observation.images.right_camera_left, observation.images.right_camera_right]
-  action_normalization:
-    method: quantile
-    normalize_indices: [0, 1, 2, 8, 9, 10]
-    stats:
-      q01: [-0.03120909258723259, -0.06520890444517136, -0.0009331027395091951, 0.957804262638092, -0.04635748639702797, -0.005277806427329779, -0.043041497468948364, 0.0, -0.03639077767729759, -0.0006847904878668487, -0.0012572933919727802, 0.9542942047119141, -0.0005909204483032227, -0.006055351346731186, -0.059804659336805344, 0.0]
-      q99: [0.08293195068836212, 0.00038992761983536184, 0.06834829598665237, 1.0, 0.001792803406715393, 0.2803484797477722, 0.060310665518045425, 1.0, 0.10343658179044724, 0.0697120949625969, 0.08555547147989273, 1.0, 0.04566377401351929, 0.2953159213066101, 0.03881560266017914, 1.0]
+    - [head_stereo.left, head_stereo.right]
+  configs: [demo_clean_nas50, demo_randomized_nas500]
+  tasks:
+    - adjust_bottle
+    - beat_block_hammer
+    - blocks_ranking_rgb
+    - blocks_ranking_size
+    - click_alarmclock
+    - click_bell
+    - dump_bin_bigbin
+    - grab_roller
+    - handover_block
+    - handover_mic
 
 policy:
   num_history_frames: 2

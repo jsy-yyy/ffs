@@ -92,7 +92,8 @@ def evaluate_model(
     raw_mae_sum = 0.0
     dataset = loader.dataset
     action_mode = getattr(dataset, "action_mode", None)
-    is_robotwin = action_mode == "relative-eef"
+    is_relative_robotwin = action_mode == "relative-eef"
+    is_absolute_robotwin = action_mode == "absolute-eef"
 
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
@@ -103,29 +104,40 @@ def evaluate_model(
             right = batch["right"].to(device, non_blocking=True)
             state = batch["state"].to(device, non_blocking=True)
             action = batch["action"].to(device, non_blocking=True)
-            if is_robotwin:
+            task_id = batch.get("task_id")
+            if task_id is not None:
+                task_id = task_id.to(device, non_blocking=True)
+            model_kwargs = {"task_id": task_id} if task_id is not None else {}
+            if is_relative_robotwin:
                 relative_action = batch["relative_action"].to(device, non_blocking=True)
+                absolute_action = batch["absolute_action"].to(device, non_blocking=True)
+            elif is_absolute_robotwin:
                 absolute_action = batch["absolute_action"].to(device, non_blocking=True)
             else:
                 raw_action = batch["raw_action"].to(device, non_blocking=True)
 
             with autocast_context(device, use_amp):
-                pred = model(left, right, state)
-                if is_robotwin:
+                pred = model(left, right, state, **model_kwargs)
+                if is_relative_robotwin:
                     action, relative_action, absolute_action = align_targets_to_prediction(
                         cfg, pred, action, relative_action, absolute_action
                     )
+                elif is_absolute_robotwin:
+                    action, absolute_action = align_targets_to_prediction(cfg, pred, action, absolute_action)
                 else:
                     action, raw_action = align_targets_to_prediction(cfg, pred, action, raw_action)
                 normalized_mse = F.mse_loss(pred, action, reduction="sum")
                 normalized_mae = F.l1_loss(pred, action, reduction="sum")
                 pred_denorm = dataset.denormalize_action(pred.float())
-                if is_robotwin:
+                if is_relative_robotwin:
                     relative_mse = F.mse_loss(pred_denorm, relative_action.float(), reduction="sum")
                     relative_mae = F.l1_loss(pred_denorm, relative_action.float(), reduction="sum")
                     absolute_pred = relative_action_to_absolute_eef_pose(pred_denorm, state[:, -1].float())
                     absolute_mse = F.mse_loss(absolute_pred, absolute_action.float(), reduction="sum")
                     absolute_mae = F.l1_loss(absolute_pred, absolute_action.float(), reduction="sum")
+                elif is_absolute_robotwin:
+                    absolute_mse = F.mse_loss(pred_denorm, absolute_action.float(), reduction="sum")
+                    absolute_mae = F.l1_loss(pred_denorm, absolute_action.float(), reduction="sum")
                 else:
                     raw_mse = F.mse_loss(pred_denorm, raw_action.float(), reduction="sum")
                     raw_mae = F.l1_loss(pred_denorm, raw_action.float(), reduction="sum")
@@ -134,9 +146,12 @@ def evaluate_model(
             total_samples += action.shape[0]
             normalized_mse_sum += float(normalized_mse.detach().cpu())
             normalized_mae_sum += float(normalized_mae.detach().cpu())
-            if is_robotwin:
+            if is_relative_robotwin:
                 relative_mse_sum += float(relative_mse.detach().cpu())
                 relative_mae_sum += float(relative_mae.detach().cpu())
+                absolute_mse_sum += float(absolute_mse.detach().cpu())
+                absolute_mae_sum += float(absolute_mae.detach().cpu())
+            elif is_absolute_robotwin:
                 absolute_mse_sum += float(absolute_mse.detach().cpu())
                 absolute_mae_sum += float(absolute_mae.detach().cpu())
             else:
@@ -145,13 +160,21 @@ def evaluate_model(
 
             if log_interval and (batch_idx + 1) % log_interval == 0:
                 running_normalized_mse = normalized_mse_sum / max(total_elements, 1)
-                if is_robotwin:
+                if is_relative_robotwin:
                     running_relative_mse = relative_mse_sum / max(total_elements, 1)
                     running_absolute_mse = absolute_mse_sum / max(total_elements, 1)
                     print(
                         f"{name}: batch={batch_idx + 1} samples={total_samples} "
                         f"normalized_mse={running_normalized_mse:.8f} "
                         f"relative_mse={running_relative_mse:.8f} "
+                        f"absolute_mse={running_absolute_mse:.8f}",
+                        flush=True,
+                    )
+                elif is_absolute_robotwin:
+                    running_absolute_mse = absolute_mse_sum / max(total_elements, 1)
+                    print(
+                        f"{name}: batch={batch_idx + 1} samples={total_samples} "
+                        f"normalized_mse={running_normalized_mse:.8f} "
                         f"absolute_mse={running_absolute_mse:.8f}",
                         flush=True,
                     )
@@ -184,7 +207,7 @@ def evaluate_model(
         "normalized_rmse": normalized_mse**0.5,
         "normalized_mae": normalized_mae_sum / total_elements,
     }
-    if is_robotwin:
+    if is_relative_robotwin:
         relative_mse = relative_mse_sum / total_elements
         absolute_mse = absolute_mse_sum / total_elements
         metrics.update(
@@ -192,6 +215,15 @@ def evaluate_model(
                 "relative_mse": relative_mse,
                 "relative_rmse": relative_mse**0.5,
                 "relative_mae": relative_mae_sum / total_elements,
+                "absolute_mse": absolute_mse,
+                "absolute_rmse": absolute_mse**0.5,
+                "absolute_mae": absolute_mae_sum / total_elements,
+            }
+        )
+    elif is_absolute_robotwin:
+        absolute_mse = absolute_mse_sum / total_elements
+        metrics.update(
+            {
                 "absolute_mse": absolute_mse,
                 "absolute_rmse": absolute_mse**0.5,
                 "absolute_mae": absolute_mae_sum / total_elements,

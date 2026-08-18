@@ -55,3 +55,7 @@ vis*
 eval_res/
 
 *.png
+*.bak*
+*test*
+*.pid
+*.csv
